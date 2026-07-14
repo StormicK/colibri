@@ -5,10 +5,10 @@
  *   - merges con rank = ordine nella lista; \p{L}/\p{N}/\s da tok_unicode.h
  *   - added_tokens (speciali e non) trattati come atomici in encode/decode
  * API:
- *   if (tok_load(&T, "tokenizer.json") != 0) ...;
+ *   tok_load(&T, "tokenizer.json");
  *   int n = tok_encode(&T, text, len, out_ids, max);
  *   int m = tok_decode(&T, ids, n, out_buf, max);
- *   tok_free(&T);
+ *   tok_free(&T);   // optional; V4 session destroy uses this
  */
 #ifndef TOK_H
 #define TOK_H
@@ -44,6 +44,7 @@ typedef struct {
     hmap merges;         /* "left\0right" -> rank */
     char **id2str; int *id_added; int n_ids;   /* id -> stringa; id_added=1 se added-token (output letterale) */
     Special *sp; int nsp;                       /* added tokens, ordinati per lunghezza decrescente */
+    jval *json_root;     /* owns vocab/special strings borrowed below */
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
 } Tok;
@@ -83,13 +84,9 @@ static void tk_build_bytemap(Tok *T){
 
 /* ---------- caricamento tokenizer.json ---------- */
 static char *tk_read_file(const char *path, long *out_n){
-    FILE *f=fopen(path,"rb"); if(!f) return NULL;
-    if(fseek(f,0,SEEK_END)!=0){ fclose(f); return NULL; }
-    long n=ftell(f); if(n<0){ fclose(f); return NULL; }
-    if(fseek(f,0,SEEK_SET)!=0){ fclose(f); return NULL; }
-    char *b=malloc((size_t)n+1); if(!b){ fclose(f); return NULL; }
-    if(fread(b,1,(size_t)n,f)!=(size_t)n){ free(b); fclose(f); return NULL; }
-    b[n]=0; fclose(f); if(out_n)*out_n=n; return b;
+    FILE *f=fopen(path,"rb"); if(!f){ perror(path); exit(1); }
+    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+    char *b=malloc(n+1); if(fread(b,1,n,f)!=(size_t)n){} b[n]=0; fclose(f); if(out_n)*out_n=n; return b;
 }
 static int cmp_sp_len(const void *a, const void *b){ return ((const Special*)b)->len - ((const Special*)a)->len; }
 
@@ -103,70 +100,55 @@ static void hm_free(hmap *m, int free_keys){
     m->e=NULL; m->cap=0;
 }
 
+/* Release all Tok allocations. vocab/special/id2str strings are borrowed from
+ * json_root; merge keys are independently malloc'd. */
 static void tok_free(Tok *T){
     if(!T) return;
-    hm_free(&T->vocab, 1);
+    /* merges keys are tok_load mallocs. */
     hm_free(&T->merges, 1);
-    if(T->sp){
-        for(int i=0;i<T->nsp;i++) free(T->sp[i].str);
-        free(T->sp);
-    }
+    /* vocab keys belong to json_root; do not free them individually. */
+    hm_free(&T->vocab, 0);
+    free(T->sp);          /* sp[i].str borrows json_root */
     free(T->id2str);
     free(T->id_added);
+    json_free(T->json_root);
     memset(T,0,sizeof(*T));
 }
 
-/* Returns 0 on success, -1 on failure (Tok left zeroed). Does not exit. */
-static int tok_load(Tok *T, const char *path){
-    if(!T || !path) return -1;
+static void tok_load(Tok *T, const char *path){
     memset(T,0,sizeof(*T));
     tk_build_bytemap(T);
-    long fn=0; char *buf=tk_read_file(path,&fn);
-    if(!buf){ fprintf(stderr,"tokenizer: cannot read %s\n", path); return -1; }
+    long fn; char *buf=tk_read_file(path,&fn);
     char *arena=NULL; jval *root=json_parse(buf,&arena);
     free(buf);
-    free(arena);
-    if(!root){ fprintf(stderr,"tokenizer.json: parse failed\n"); return -1; }
+    /* arena is always NULL with the current parser (j_dup allocates each string). */
+    (void)arena;
     jval *model=json_get(root,"model");
     jval *vocab=json_get(model,"vocab");
     jval *merges=json_get(model,"merges");
     jval *added=json_get(root,"added_tokens");
-    if(!vocab||!merges){
-        fprintf(stderr,"tokenizer.json: missing model.vocab/merges\n");
-        json_free(root);
-        return -1;
-    }
+    if(!vocab||!merges){ fprintf(stderr,"tokenizer.json: missing model.vocab/merges\n"); exit(1); }
 
     /* id massimo per dimensionare id2str */
     int maxid=0;
     for(int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num; if(id>maxid)maxid=id; }
-    if(added) for(int i=0;i<added->len;i++){
-        jval *idv=json_get(added->kids[i],"id");
-        if(idv){ int id=(int)idv->num; if(id>maxid)maxid=id; }
-    }
+    if(added) for(int i=0;i<added->len;i++){ int id=(int)json_get(added->kids[i],"id")->num; if(id>maxid)maxid=id; }
     T->n_ids=maxid+1;
-    T->id2str=calloc((size_t)T->n_ids,sizeof(char*));
-    T->id_added=calloc((size_t)T->n_ids,sizeof(int));
-    if(!T->id2str || !T->id_added){ tok_free(T); json_free(root); return -1; }
+    T->id2str=calloc(T->n_ids,sizeof(char*));
+    T->id_added=calloc(T->n_ids,sizeof(int));
 
-    /* vocab: stringa -> id  (capacita' potenza di 2, ~2-3x); own copies. */
+    /* vocab: stringa -> id  (capacita' potenza di 2, ~2-3x); borrow JSON keys. */
     int vc=1; while(vc < vocab->len*2) vc<<=1;
     hm_init(&T->vocab, vc);
-    if(!T->vocab.e){ tok_free(T); json_free(root); return -1; }
     for(int i=0;i<vocab->len;i++){
         const char *k=vocab->keys[i]; int id=(int)vocab->kids[i]->num;
-        size_t klen=strlen(k);
-        char *owned=malloc(klen+1);
-        if(!owned){ tok_free(T); json_free(root); return -1; }
-        memcpy(owned,k,klen+1);
-        hm_put(&T->vocab, owned, (int)klen, id);
-        if(id>=0 && id<T->n_ids) T->id2str[id]=owned;
+        hm_put(&T->vocab, k, (int)strlen(k), id);
+        T->id2str[id]=(char*)k;
     }
     /* merges: HF accepts either [left,right] pairs or "left right" strings.
      * Internally both become "left\0right" -> rank=i. */
     int mc=1; while(mc < merges->len*2) mc<<=1;
     hm_init(&T->merges, mc);
-    if(!T->merges.e){ tok_free(T); json_free(root); return -1; }
     for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
         const char *l=NULL, *r=NULL; int ll=0, rl=0;
@@ -178,34 +160,21 @@ static int tok_load(Tok *T, const char *path){
             if(!separator) continue;
             l=pr->str; ll=(int)(separator-l); r=separator+1; rl=(int)strlen(r);
         }else continue;
-        char *key=malloc((size_t)ll+1+(size_t)rl);
-        if(!key){ tok_free(T); json_free(root); return -1; }
-        memcpy(key,l,(size_t)ll); key[ll]=0; memcpy(key+ll+1,r,(size_t)rl);
+        char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
         hm_put(&T->merges, key, ll+1+rl, i);
     }
-    /* added tokens (speciali e non): atomici, output letterale */
+    /* added tokens (speciali e non): atomici, output letterale; borrow content. */
     if(added){
-        T->nsp=added->len; T->sp=calloc((size_t)T->nsp,sizeof(Special));
-        if(!T->sp){ tok_free(T); json_free(root); return -1; }
+        T->nsp=added->len; T->sp=calloc(T->nsp,sizeof(Special));
         for(int i=0;i<added->len;i++){
             jval *a=added->kids[i];
-            jval *content_v=json_get(a,"content");
-            jval *id_v=json_get(a,"id");
-            if(!content_v || !id_v || content_v->t!=J_STR){
-                tok_free(T); json_free(root); return -1;
-            }
-            char *content=content_v->str; int id=(int)id_v->num;
-            size_t clen=strlen(content);
-            char *owned=malloc(clen+1);
-            if(!owned){ tok_free(T); json_free(root); return -1; }
-            memcpy(owned,content,clen+1);
-            T->sp[i].str=owned; T->sp[i].len=(int)clen; T->sp[i].id=id;
-            if(id>=0 && id<T->n_ids){ T->id2str[id]=owned; T->id_added[id]=1; }
+            char *content=json_get(a,"content")->str; int id=(int)json_get(a,"id")->num;
+            T->sp[i].str=content; T->sp[i].len=(int)strlen(content); T->sp[i].id=id;
+            T->id2str[id]=content; T->id_added[id]=1;
         }
         qsort(T->sp,T->nsp,sizeof(Special),cmp_sp_len);   /* match piu' lungo per primo */
     }
-    json_free(root);
-    return 0;
+    T->json_root=root;
 }
 
 /* ---------- BPE su un pezzo: byte grezzi [a,b) -> id appesi a out ---------- */

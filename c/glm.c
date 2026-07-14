@@ -4281,7 +4281,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
  * detokenizza e stampa il testo in streaming. */
 static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Cfg *c=&m->c; char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; if(tok_load(&T,tkp)!=0){ fprintf(stderr,"cannot load tokenizer\n"); return; }
+    Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm(&m->c, eos);
     grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
@@ -4289,7 +4289,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
                                           * distribuzione int4 e' rumore di quantizzazione */
     int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
-    if(np<1){ fprintf(stderr,"prompt is empty after tokenization\n"); tok_free(&T); return; }
+    if(np<1){ fprintf(stderr,"prompt is empty after tokenization\n"); return; }
     printf("prompt: %d tokens | generating up to %d (EOS stop=%d) | n-gram draft=%d\n", np, ngen, eos, g_draft);
     fputs(prompt,stdout); fflush(stdout);
     kv_alloc(m, np+ngen+g_draft+2);
@@ -4364,7 +4364,6 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
     free(pids); free(all);
-    tok_free(&T);
     usage_save(m);
 }
 
@@ -4743,7 +4742,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
 
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; if(tok_load(&T,tkp)!=0){ fprintf(stderr,"cannot load tokenizer\n"); exit(1); } int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm(&m->c,eos);
+    Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm(&m->c,eos);
     g_draft=0; /* one scheduler owns every forward; MTP/speculation is not ragged-safe */
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
@@ -4842,7 +4841,7 @@ static void run_serve(Model *m, const char *snap){
     setvbuf(stdout, NULL, _IONBF, 0);
 #endif
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; if(tok_load(&T,tkp)!=0){ fprintf(stderr,"cannot load tokenizer\n"); exit(1); }
+    Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm(&m->c, eos);
     grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
