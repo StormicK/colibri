@@ -31,6 +31,13 @@ int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
 int coli_fp4_matmul_batch_float_v4(float *outputs,
                                    const ColiTensorView *weight,
                                    const float *inputs, int batch);
+int coli_fp8_matvec_float_ref(float *output, const ColiTensorView *weight,
+                              const float *input);
+int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
+                             const ColiTensorView *a, const ColiTensorView *b,
+                             const float *input);
+int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
+                              const float *inputs, int batch);
 
 #ifndef __AVX2__
 
@@ -209,6 +216,142 @@ done:
     return failed;
 }
 
+static void fill_fp8_tensor(ColiTensorView *view, uint8_t *data,
+                            uint8_t *scales, int64_t rows, int64_t columns,
+                            int denormals_only) {
+    size_t data_bytes = (size_t)rows * (size_t)columns;
+    size_t scale_bytes = (size_t)((rows + 127) / 128) *
+                         ((size_t)columns / 128);
+    for (size_t i = 0; i < data_bytes; i++) {
+        uint8_t byte = (uint8_t)rng32();
+        if (denormals_only) byte &= 0x87;         /* e=0: sign + mantissa */
+        while ((byte & 0x7f) == 0x7f) byte = (uint8_t)rng32(); /* no NaN */
+        data[i] = byte;
+    }
+    for (size_t i = 0; i < scale_bytes; i++)
+        scales[i] = (uint8_t)(119 + rng32() % 15);
+    memset(view, 0, sizeof(*view));
+    view->format = COLI_TENSOR_FP8_E4M3_BLOCK;
+    view->scale_format = COLI_SCALE_UE8M0;
+    view->data = data;
+    view->scales = scales;
+    view->data_bytes = data_bytes;
+    view->scale_bytes = scale_bytes;
+    view->rows = rows;
+    view->columns = columns;
+    view->block_rows = 128;
+    view->block_columns = 128;
+}
+
+/* fp64 dot of the dequantized FP8 weights with an already-QDQ'd activation:
+ * both kernel families use this exact math, so they must land within float
+ * summation-order distance of it. */
+static void exact_fp8_matvec(double *output, const ColiTensorView *w,
+                             const float *activation) {
+    const uint8_t *data = w->data, *scales = w->scales;
+    size_t columns = (size_t)w->columns, scale_columns = columns / 128;
+    for (int64_t row = 0; row < w->rows; row++) {
+        double sum = 0.0;
+        size_t scale_base = ((size_t)row / 128) * scale_columns;
+        for (size_t column = 0; column < columns; column++)
+            sum += (double)activation[column] *
+                   (double)coli_e4m3fn_decode(data[(size_t)row * columns +
+                                                   column]) *
+                   (double)coli_e8m0_decode(scales[scale_base + column / 128]);
+        output[row] = sum;
+    }
+}
+
+static int check_fp8(int64_t rows, int64_t columns, int denormals_only) {
+    size_t r = (size_t)rows, c = (size_t)columns;
+    size_t scale_bytes = (size_t)((rows + 127) / 128) * (c / 128);
+    uint8_t *data_a = malloc(r * c), *scales_a = malloc(scale_bytes);
+    uint8_t *data_b = malloc(r * c), *scales_b = malloc(scale_bytes);
+    float *input = malloc(c * sizeof(float));
+    float *qdq = malloc(c * sizeof(float));
+    uint8_t *qdq_scales = malloc(c / 128);
+    float *out_avx2 = malloc(r * sizeof(float));
+    float *out_float = malloc(r * sizeof(float));
+    float *dual_a = malloc(r * sizeof(float));
+    float *dual_b = malloc(r * sizeof(float));
+    double *truth = malloc(r * sizeof(double));
+    ColiTensorView a, b;
+    int failed = 1;
+    if (!data_a || !scales_a || !data_b || !scales_b || !input || !qdq ||
+        !qdq_scales || !out_avx2 || !out_float || !dual_a || !dual_b ||
+        !truth)
+        goto done;
+    fill_fp8_tensor(&a, data_a, scales_a, rows, columns, denormals_only);
+    fill_fp8_tensor(&b, data_b, scales_b, rows, columns, denormals_only);
+    fill_input(input, c);
+
+    if (coli_fp8_matvec_ref(out_avx2, &a, input) ||
+        coli_fp8_matvec_float_ref(out_float, &a, input) ||
+        coli_fp8_activation_qdq_ref(qdq, qdq_scales, input, c, 128)) {
+        fprintf(stderr, "fp8 matvec failed (%lld x %lld)\n",
+                (long long)rows, (long long)columns);
+        goto done;
+    }
+    exact_fp8_matvec(truth, &a, qdq);
+    double err_avx2 = rel_l2_error(out_avx2, truth, rows);
+    double err_float = rel_l2_error(out_float, truth, rows);
+    if (err_avx2 > 1e-4 || err_float > 1e-4) {
+        fprintf(stderr, "fp8 accuracy: avx2 %.3g float %.3g (%lld x %lld%s)\n",
+                err_avx2, err_float, (long long)rows, (long long)columns,
+                denormals_only ? ", denormals" : "");
+        goto done;
+    }
+
+    if (coli_fp8_dual_matvec_ref(dual_a, dual_b, &a, &b, input) ||
+        memcmp(dual_a, out_avx2, r * sizeof(float))) {
+        fprintf(stderr, "fp8 dual != single (a)\n");
+        goto done;
+    }
+    if (coli_fp8_matvec_ref(out_float, &b, input) ||
+        memcmp(dual_b, out_float, r * sizeof(float))) {
+        fprintf(stderr, "fp8 dual != single (b)\n");
+        goto done;
+    }
+
+    failed = 0;
+done:
+    free(truth); free(dual_b); free(dual_a); free(out_float);
+    free(out_avx2); free(qdq_scales); free(qdq); free(input);
+    free(data_b); free(scales_b); free(data_a); free(scales_a);
+    return failed;
+}
+
+static int check_fp8_batch(int64_t rows, int64_t columns, int batch) {
+    size_t r = (size_t)rows, c = (size_t)columns;
+    size_t scale_bytes = (size_t)((rows + 127) / 128) * (c / 128);
+    uint8_t *data = malloc(r * c), *scales = malloc(scale_bytes);
+    float *inputs = malloc((size_t)batch * c * sizeof(float));
+    float *outputs = malloc((size_t)batch * r * sizeof(float));
+    float *single = malloc(r * sizeof(float));
+    ColiTensorView w;
+    int failed = 1;
+    if (!data || !scales || !inputs || !outputs || !single) goto done;
+    fill_fp8_tensor(&w, data, scales, rows, columns, 0);
+    for (int item = 0; item < batch; item++)
+        fill_input(inputs + (size_t)item * c, c);
+    if (coli_fp8_matmul_batch_ref(outputs, &w, inputs, batch)) {
+        fprintf(stderr, "fp8 batch matmul failed (batch=%d)\n", batch);
+        goto done;
+    }
+    for (int item = 0; item < batch; item++) {
+        if (coli_fp8_matvec_ref(single, &w, inputs + (size_t)item * c) ||
+            memcmp(outputs + (size_t)item * r, single, r * sizeof(float))) {
+            fprintf(stderr, "fp8 batch item %d != single (batch=%d)\n",
+                    item, batch);
+            goto done;
+        }
+    }
+    failed = 0;
+done:
+    free(single); free(outputs); free(inputs); free(scales); free(data);
+    return failed;
+}
+
 static int check_dispatch_off(void) {
     enum { ROWS = 24, COLUMNS = 256, BATCH = 3 };
     uint8_t data[ROWS * COLUMNS / 2], scales[ROWS * COLUMNS / 32];
@@ -262,6 +405,13 @@ int main(void) {
     if (check_batch(64, 512, 5)) return 1;
     if (check_batch(33, 1024, 33)) return 1;
     if (check_batch(16, 7168, 24)) return 1;
+
+    /* FP8: random tensors, a >1-row-block shape, and a denormal-only one */
+    if (check_fp8(64, 512, 0)) return 1;
+    if (check_fp8(300, 4096, 0)) return 1;
+    if (check_fp8(64, 256, 1)) return 1;
+    if (check_fp8_batch(64, 512, 1)) return 1;
+    if (check_fp8_batch(300, 1024, 24)) return 1;
 
     if (check_dispatch_off()) return 1;
 

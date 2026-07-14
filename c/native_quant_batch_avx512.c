@@ -92,8 +92,10 @@ int coli_fp4_matmul_batch_float_v4(float *outputs, const ColiTensorView *weight,
 
 #undef coli_fp8_matmul_batch_ref
 
-int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
-                              const float *inputs, int batch) {
+/* Exported as the float fallback (AVX-512 gather or scalar baseline);
+ * coli_fp8_matmul_batch_ref itself now lives in native_quant_avx2.c. */
+int coli_fp8_matmul_batch_float_v6(float *outputs, const ColiTensorView *weight,
+                                   const float *inputs, int batch) {
 #ifndef __AVX512F__
     return coli_fp8_matmul_batch_baseline_v6(outputs, weight, inputs, batch);
 #else

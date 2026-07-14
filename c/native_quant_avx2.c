@@ -25,8 +25,10 @@
 #include "native_quant_parallel.c"
 #include "native_quant_dual.c"
 
-/* Interleaved float batch kernel (native_quant_batch_avx512.c). */
+/* Float batch kernels (native_quant_batch_avx512.c). */
 int coli_fp4_matmul_batch_float_v4(float *outputs, const ColiTensorView *weight,
+                                   const float *inputs, int batch);
+int coli_fp8_matmul_batch_float_v6(float *outputs, const ColiTensorView *weight,
                                    const float *inputs, int batch);
 
 static int avx2_dispatch_enabled(void) {
@@ -41,6 +43,16 @@ static int fp4_view_standard(const ColiTensorView *w) {
            w->block_rows == 1 && w->block_columns == 32 &&
            w->data_bytes == (size_t)w->rows * (size_t)w->columns / 2 &&
            w->scale_bytes == (size_t)w->rows * (size_t)w->columns / 32;
+}
+
+static int fp8_view_standard(const ColiTensorView *w) {
+    return w && w->format == COLI_TENSOR_FP8_E4M3_BLOCK &&
+           w->scale_format == COLI_SCALE_UE8M0 && w->data && w->scales &&
+           w->rows >= 1 && w->columns >= 1 && !(w->columns % 128) &&
+           w->block_rows == 128 && w->block_columns == 128 &&
+           w->data_bytes == (size_t)w->rows * (size_t)w->columns &&
+           w->scale_bytes == (size_t)((w->rows + 127) / 128) *
+                             ((size_t)w->columns / 128);
 }
 
 #ifdef __AVX2__
@@ -252,6 +264,171 @@ int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
     return 0;
 }
 
+/* ---- FP8 (E4M3, 128x128 UE8M0 block scales): the attention projections.
+ * Same float math as the reference - E4M3-simulated activations, f32
+ * accumulation - but the weight dequant runs 8 lanes wide: fp32 bits are
+ * built directly from the E4M3 fields (bias rebase 7 -> 127), with a
+ * branchless blend for e=0 denormals (value = m * 2^-9). The two NaN
+ * encodings (0x7f/0xff) decode to finite 480 instead of NaN; NaN weights
+ * would already poison the reference path, so no valid checkpoint hits
+ * this. Accumulation is per 128-column block, then one FMA by the block
+ * scale - the same product grouping as the reference, so results differ
+ * only by float summation order. */
+static inline __m256 fp8_values8(const uint8_t *weights) {
+    __m256i v = _mm256_cvtepu8_epi32(
+        _mm_loadl_epi64((const __m128i *)weights));
+    __m256i mag = _mm256_and_si256(v, _mm256_set1_epi32(0x7f));
+    __m256i sign = _mm256_slli_epi32(
+        _mm256_and_si256(v, _mm256_set1_epi32(0x80)), 24);
+    __m256 normal = _mm256_castsi256_ps(_mm256_add_epi32(
+        _mm256_slli_epi32(mag, 20), _mm256_set1_epi32(120 << 23)));
+    __m256 denormal = _mm256_mul_ps(_mm256_cvtepi32_ps(mag),
+                                    _mm256_set1_ps(1.0f / 512.0f));
+    __m256 magnitude = _mm256_blendv_ps(normal, denormal,
+        _mm256_castsi256_ps(_mm256_cmpeq_epi32(
+            _mm256_srli_epi32(mag, 3), _mm256_setzero_si256())));
+    return _mm256_castsi256_ps(_mm256_or_si256(
+        _mm256_castps_si256(magnitude), sign));
+}
+
+static inline float fp8_row_dot(const uint8_t *row_data,
+                                const uint8_t *scales, size_t scale_base,
+                                const float *activation, const float *e8,
+                                size_t columns) {
+    __m256 acc = _mm256_setzero_ps();
+    for (size_t base = 0; base < columns; base += 128) {
+        __m256 block = _mm256_setzero_ps();
+        for (size_t i = 0; i < 128; i += 8)
+            block = _mm256_fmadd_ps(fp8_values8(row_data + base + i),
+                                    _mm256_loadu_ps(activation + base + i),
+                                    block);
+        acc = _mm256_fmadd_ps(block,
+                              _mm256_set1_ps(e8[scales[scale_base + base / 128]]),
+                              acc);
+    }
+    return hsum256(acc);
+}
+
+/* Shared activation prep: the reference's E4M3 QDQ in blocks of 128. */
+static float *fp8_prepare_activation(const float *input, size_t columns,
+                                     int items) {
+    float *activation = malloc((size_t)items * columns * sizeof(*activation));
+    uint8_t *scratch = malloc(columns / 128);
+    if (!activation || !scratch) {
+        free(scratch); free(activation);
+        return NULL;
+    }
+    for (int item = 0; item < items; item++)
+        if (coli_fp8_activation_qdq_ref(activation + (size_t)item * columns,
+                                        scratch, input + (size_t)item * columns,
+                                        columns, 128)) {
+            free(scratch); free(activation);
+            return NULL;
+        }
+    free(scratch);
+    return activation;
+}
+
+int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
+                        const float *input) {
+    if (!output || !input || !fp8_view_standard(weight) ||
+        !avx2_dispatch_enabled())
+        return coli_fp8_matvec_float_ref(output, weight, input);
+    size_t columns = (size_t)weight->columns;
+    size_t scale_columns = columns / 128;
+    float *activation = fp8_prepare_activation(input, columns, 1);
+    if (!activation)
+        return coli_fp8_matvec_float_ref(output, weight, input);
+    const float *e8 = e8m0_table();
+    const uint8_t *data = weight->data, *scales = weight->scales;
+    #pragma omp parallel for schedule(static)
+    for (int64_t row = 0; row < weight->rows; row++)
+        output[row] = fp8_row_dot(data + (size_t)row * columns, scales,
+                                  ((size_t)row / 128) * scale_columns,
+                                  activation, e8, columns);
+    free(activation);
+    return 0;
+}
+
+int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
+                             const ColiTensorView *a,
+                             const ColiTensorView *b, const float *input) {
+    if (!output_a || !output_b || !input ||
+        !fp8_view_standard(a) || !fp8_view_standard(b) ||
+        a->rows != b->rows || a->columns != b->columns ||
+        !avx2_dispatch_enabled())
+        return coli_fp8_dual_matvec_float_ref(output_a, output_b, a, b,
+                                              input);
+    size_t columns = (size_t)a->columns;
+    size_t scale_columns = columns / 128;
+    float *activation = fp8_prepare_activation(input, columns, 1);
+    if (!activation)
+        return coli_fp8_dual_matvec_float_ref(output_a, output_b, a, b,
+                                              input);
+    const float *e8 = e8m0_table();
+    const uint8_t *data_a = a->data, *scales_a = a->scales;
+    const uint8_t *data_b = b->data, *scales_b = b->scales;
+    #pragma omp parallel for schedule(static)
+    for (int64_t row = 0; row < a->rows; row++) {
+        size_t row_data = (size_t)row * columns;
+        size_t scale_base = ((size_t)row / 128) * scale_columns;
+        output_a[row] = fp8_row_dot(data_a + row_data, scales_a, scale_base,
+                                    activation, e8, columns);
+        output_b[row] = fp8_row_dot(data_b + row_data, scales_b, scale_base,
+                                    activation, e8, columns);
+    }
+    free(activation);
+    return 0;
+}
+
+int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
+                              const float *inputs, int batch) {
+    enum { BATCH_MAX = 64 };
+    if (!outputs || !inputs || batch < 1 || batch > BATCH_MAX ||
+        !fp8_view_standard(weight) || !avx2_dispatch_enabled())
+        return coli_fp8_matmul_batch_float_v6(outputs, weight, inputs,
+                                              batch);
+    size_t rows = (size_t)weight->rows, columns = (size_t)weight->columns;
+    size_t scale_columns = columns / 128;
+    float *activation = fp8_prepare_activation(inputs, columns, batch);
+    if (!activation)
+        return coli_fp8_matmul_batch_float_v6(outputs, weight, inputs,
+                                              batch);
+    const float *e8 = e8m0_table();
+    const uint8_t *data = weight->data, *scales = weight->scales;
+    /* Weights convert once per 8 columns and stay in registers across the
+     * batch; per-item block grouping matches fp8_row_dot exactly, so each
+     * item's column equals the single-matvec result bit for bit. */
+    #pragma omp parallel for schedule(static)
+    for (int64_t row = 0; row < weight->rows; row++) {
+        const uint8_t *row_data = data + (size_t)row * columns;
+        size_t scale_base = ((size_t)row / 128) * scale_columns;
+        __m256 acc[BATCH_MAX], block[BATCH_MAX];
+        for (int item = 0; item < batch; item++)
+            acc[item] = _mm256_setzero_ps();
+        for (size_t base = 0; base < columns; base += 128) {
+            for (int item = 0; item < batch; item++)
+                block[item] = _mm256_setzero_ps();
+            for (size_t i = 0; i < 128; i += 8) {
+                __m256 values = fp8_values8(row_data + base + i);
+                for (int item = 0; item < batch; item++)
+                    block[item] = _mm256_fmadd_ps(values,
+                        _mm256_loadu_ps(activation + (size_t)item * columns +
+                                        base + i),
+                        block[item]);
+            }
+            __m256 scale = _mm256_set1_ps(
+                e8[scales[scale_base + base / 128]]);
+            for (int item = 0; item < batch; item++)
+                acc[item] = _mm256_fmadd_ps(block[item], scale, acc[item]);
+        }
+        for (int item = 0; item < batch; item++)
+            outputs[(size_t)item * rows + (size_t)row] = hsum256(acc[item]);
+    }
+    free(activation);
+    return 0;
+}
+
 #else /* !__AVX2__: keep the exported names, forward to the float kernels. */
 
 int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
@@ -269,6 +446,23 @@ int coli_fp4_dual_matvec_ref(float *output_a, float *output_b,
 int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                               const float *inputs, int batch) {
     return coli_fp4_matmul_batch_float_v4(outputs, weight, inputs, batch);
+}
+
+int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
+                        const float *input) {
+    (void)fp8_view_standard;
+    return coli_fp8_matvec_float_ref(output, weight, input);
+}
+
+int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
+                             const ColiTensorView *a,
+                             const ColiTensorView *b, const float *input) {
+    return coli_fp8_dual_matvec_float_ref(output_a, output_b, a, b, input);
+}
+
+int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
+                              const float *inputs, int batch) {
+    return coli_fp8_matmul_batch_float_v6(outputs, weight, inputs, batch);
 }
 
 #endif /* __AVX2__ */
