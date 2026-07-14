@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "tensor.h"
 
@@ -36,6 +37,24 @@ typedef struct {
     uint64_t capacity_bytes;
 } ColiExpertStoreStats;
 
+/*
+ * ExpertStore lease contract:
+ *
+ * - After a successful lookup(), the caller must call release() exactly once
+ *   on the same view (same store). Do not copy ColiExpertView; the lease is
+ *   not shareable. Do not pass a view that already holds an active lease to
+ *   lookup().
+ * - On lookup failure the view is cleared; the caller must not use it and
+ *   must not call release().
+ * - release() clears the entire view. release() on an already-cleared or
+ *   zero-initialized view is a no-op.
+ * - destroy() requires zero active leases (debug builds assert).
+ * - lookup/release/prefetch/stats/destroy are thread-safe with respect to the
+ *   same store (serialized by the implementation). Views must not be used
+ *   concurrently from multiple threads.
+ * - prefetch() is advisory, holds no lease, and must not evict a slot that
+ *   still has an active lease.
+ */
 typedef struct {
     /* Returns zero on success. The view remains valid until release(). */
     int (*lookup)(ColiExpertStore *store, ColiExpertKey key,
@@ -56,14 +75,20 @@ struct ColiExpertStore {
 static inline int coli_expert_lookup(ColiExpertStore *store,
                                      ColiExpertKey key,
                                      ColiExpertView *view) {
-    return store && store->ops && store->ops->lookup
-        ? store->ops->lookup(store, key, view) : -1;
+    if (!store || !store->ops || !store->ops->lookup) {
+        if (view) memset(view, 0, sizeof(*view));
+        return -1;
+    }
+    int result = store->ops->lookup(store, key, view);
+    if (result != 0 && view) memset(view, 0, sizeof(*view));
+    return result;
 }
 
 static inline void coli_expert_release(ColiExpertStore *store,
                                        ColiExpertView *view) {
     if (store && store->ops && store->ops->release)
         store->ops->release(store, view);
+    if (view) memset(view, 0, sizeof(*view));
 }
 
 #ifdef __cplusplus

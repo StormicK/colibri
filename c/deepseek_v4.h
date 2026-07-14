@@ -1,22 +1,14 @@
 #ifndef COLIBRI_DEEPSEEK_V4_H
 #define COLIBRI_DEEPSEEK_V4_H
 
-#include "tensor.h"
-#include "expert_store.h"
-#include "native_quant.h"
-#include "native_quant_batch.h"
-#include "native_quant_dual.h"
-#include "native_quant_fp4_rows16.h"
-#include "safetensors_index.h"
-#include "tensor_io.h"
-
-/* ==== begin deepseek_v4_config.h ==== */
-
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ---- config (stable) ---- */
 
 #define COLI_V4_MAX_LAYERS 128
 
@@ -62,539 +54,7 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
 int coli_v4_config_load(ColiDeepSeekV4Config *config, const char *model_dir,
                         char *error, size_t error_size);
 
-#ifdef __cplusplus
-}
-#endif
-/* ==== end deepseek_v4_config.h ==== */
-
-/* ==== begin deepseek_v4_math.h ==== */
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-int coli_v4_hc_split_sinkhorn(float *pre, float *post, float *comb,
-                              const float *mixes, const float scale[3],
-                              const float *base, int hc, int iterations,
-                              float eps);
-
-int coli_v4_hc_pre(float *output, float *post, float *comb,
-                   const float *input, const float *hc_fn,
-                   const float scale[3], const float *base,
-                   int hc, int dimension, int iterations,
-                   float norm_eps, float hc_eps);
-
-int coli_v4_hc_post(float *output, const float *branch,
-                    const float *residual, const float *post,
-                    const float *comb, int hc, int dimension);
-
-int coli_v4_rmsnorm(float *output, const float *input, const float *weight,
-                    int dimension, float eps);
-
-int coli_v4_rope_precompute(float *cosines, float *sines,
-                            int dimension, int sequence_length,
-                            int original_sequence_length, float base,
-                            float factor, int beta_fast, int beta_slow);
-
-int coli_v4_rope_apply(float *vectors, int vector_count, int dimension,
-                       const float *cosines, const float *sines, int inverse);
-
-int coli_v4_route(float *weights, int *indices, const float *hidden,
-                  const float *gate, const float *bias,
-                  const int *forced_indices, int experts, int dimension,
-                  int topk, float route_scale);
-
-int coli_v4_swiglu(float *output, const float *gate, const float *up,
-                   int dimension, float limit);
-
-#ifdef __cplusplus
-}
-#endif
-/* ==== end deepseek_v4_math.h ==== */
-
-/* ==== begin deepseek_v4_layer.h ==== */
-
-#include <stddef.h>
-#include <stdint.h>
-
-/* amalgamated: deepseek_v4_config.h */
-#include "safetensors_index.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-#define COLI_V4_MAX_LAYER_TENSORS 48
-#define COLI_V4_MAX_TENSOR_NAME 160
-
-typedef struct {
-    char name[COLI_V4_MAX_TENSOR_NAME];
-    ColiSafetensorsDType dtype;
-    int rank;
-    int64_t shape[COLI_ST_MAX_RANK];
-} ColiDeepSeekV4TensorSpec;
-
-typedef struct {
-    int layer;
-    int compression_ratio;
-    int uses_hash_router;
-    int has_compressor;
-    int has_indexer;
-    size_t tensor_count;
-    ColiDeepSeekV4TensorSpec tensors[COLI_V4_MAX_LAYER_TENSORS];
-} ColiDeepSeekV4LayerPlan;
-
-typedef struct {
-    size_t tensor_count;
-    uint64_t total_bytes;
-    uint64_t bf16_bytes;
-    uint64_t f32_bytes;
-    uint64_t fp8_weight_bytes;
-    uint64_t fp8_scale_bytes;
-    uint64_t i64_bytes;
-} ColiDeepSeekV4LayerStats;
-
-typedef struct {
-    ColiDeepSeekV4LayerPlan plan;
-    ColiDeepSeekV4LayerStats stats;
-    void *data[COLI_V4_MAX_LAYER_TENSORS];
-} ColiDeepSeekV4LayerWeights;
-
-int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
-                       const ColiDeepSeekV4Config *config, int layer,
-                       char *error, size_t error_size);
-int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
-                           const ColiSafetensorsIndex *index,
-                           ColiDeepSeekV4LayerStats *stats,
-                           char *error, size_t error_size);
-int coli_v4_layer_load(ColiDeepSeekV4LayerWeights *weights,
-                       const ColiDeepSeekV4Config *config,
-                       const ColiSafetensorsIndex *index, int layer,
-                       char *error, size_t error_size);
-void coli_v4_layer_free(ColiDeepSeekV4LayerWeights *weights);
-const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
-                               const char *name,
-                               const ColiDeepSeekV4TensorSpec **spec);
-
-#ifdef __cplusplus
-}
-#endif
-/* ==== end deepseek_v4_layer.h ==== */
-
-/* ==== begin deepseek_v4_sparse_attention.h ==== */
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-int coli_v4_sparse_attention_ref(float *output, const float *queries,
-                                 const float *kv, const float *sinks,
-                                 const int *indices, int heads,
-                                 int head_dimension, int kv_count, int topk,
-                                 float softmax_scale);
-
-#ifdef __cplusplus
-}
-#endif
-/* ==== end deepseek_v4_sparse_attention.h ==== */
-
-/* ==== begin deepseek_v4_kv_cache.h ==== */
-
-#include <stddef.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-typedef struct ColiDeepSeekV4KVCache ColiDeepSeekV4KVCache;
-
-int coli_v4_kv_cache_create(ColiDeepSeekV4KVCache **cache,
-                            int window_size, int compression_ratio,
-                            int head_dimension, int max_context);
-void coli_v4_kv_cache_reset(ColiDeepSeekV4KVCache *cache);
-void coli_v4_kv_cache_destroy(ColiDeepSeekV4KVCache *cache);
-int coli_v4_kv_cache_put_window(ColiDeepSeekV4KVCache *cache,
-                                int position, const float *kv);
-int coli_v4_kv_cache_put_compressed(ColiDeepSeekV4KVCache *cache,
-                                    int position, const float *kv);
-int coli_v4_kv_cache_indices(const ColiDeepSeekV4KVCache *cache,
-                             int position, int *indices, size_t capacity);
-const float *coli_v4_kv_cache_values(const ColiDeepSeekV4KVCache *cache);
-int coli_v4_kv_cache_value_count(const ColiDeepSeekV4KVCache *cache);
-
-#ifdef __cplusplus
-}
-#endif
-/* ==== end deepseek_v4_kv_cache.h ==== */
-
-/* ==== begin deepseek_v4_attention_cache.h ==== */
-
-#include <stddef.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-typedef struct ColiDeepSeekV4AttentionCache ColiDeepSeekV4AttentionCache;
-
-int coli_v4_attention_cache_create(ColiDeepSeekV4AttentionCache **cache,
-                                   int window_size, int compression_ratio,
-                                   int head_dimension, int max_context);
-void coli_v4_attention_cache_reset(ColiDeepSeekV4AttentionCache *cache);
-void coli_v4_attention_cache_destroy(ColiDeepSeekV4AttentionCache *cache);
-
-/* query is [heads, head_dimension]. window_kv and compressed_kv have one
- * head_dimension vector each. compressed_kv is required at ratio boundaries. */
-int coli_v4_attention_cache_step(ColiDeepSeekV4AttentionCache *cache,
-                                 float *output, const float *query,
-                                 const float *window_kv,
-                                 const float *compressed_kv,
-                                 const float *sinks, int heads,
-                                 int position, float softmax_scale);
-
-#ifdef __cplusplus
-}
-#endif
-/* ==== end deepseek_v4_attention_cache.h ==== */
-
-/* ==== begin deepseek_v4_attention.h ==== */
-
-#include <stddef.h>
-
-/* amalgamated: deepseek_v4_config.h */
-/* amalgamated: deepseek_v4_layer.h */
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-typedef struct ColiDeepSeekV4WindowAttentionState
-    ColiDeepSeekV4WindowAttentionState;
-
-int coli_v4_window_attention_create(ColiDeepSeekV4WindowAttentionState **state,
-                                    const ColiDeepSeekV4Config *config);
-void coli_v4_window_attention_reset(ColiDeepSeekV4WindowAttentionState *state);
-void coli_v4_window_attention_destroy(ColiDeepSeekV4WindowAttentionState *state);
-
-/* Correctness-first single-KV attention. Compressed layers may use this at
- * position zero, before any compressed KV/indexer candidate exists. */
-int coli_v4_attention_token_ref(float *output,
-                                const ColiDeepSeekV4LayerWeights *weights,
-                                const ColiDeepSeekV4Config *config,
-                                const float *input, int position,
-                                char *error, size_t error_size);
-int coli_v4_attention_window_token_ref(
-    float *output, ColiDeepSeekV4WindowAttentionState *state,
-    const ColiDeepSeekV4LayerWeights *weights,
-    const ColiDeepSeekV4Config *config, const float *input, int position,
-    char *error, size_t error_size);
-
-#ifdef __cplusplus
-}
-#endif
-/* ==== end deepseek_v4_attention.h ==== */
-
-/* ==== begin deepseek_v4_attention_batch.h ==== */
-
-/* amalgamated: deepseek_v4_attention.h */
-
-int coli_v4_attention_window_batch_ref(
-    float *outputs, ColiDeepSeekV4WindowAttentionState *state,
-    const ColiDeepSeekV4LayerWeights *weights,
-    const ColiDeepSeekV4Config *config, const float *inputs,
-    int start_position, int batch, char *error, size_t error_size);
-/* ==== end deepseek_v4_attention_batch.h ==== */
-
-/* ==== begin deepseek_v4_attention_transaction.h ==== */
-
-/* amalgamated: deepseek_v4_attention.h */
-
-typedef struct ColiV4AttentionSnapshot ColiV4AttentionSnapshot;
-
-int coli_v4_attention_snapshot_create(
-    const ColiDeepSeekV4WindowAttentionState *state,
-    ColiV4AttentionSnapshot **output);
-int coli_v4_attention_snapshot_restore(
-    ColiDeepSeekV4WindowAttentionState *state,
-    const ColiV4AttentionSnapshot *snapshot);
-void coli_v4_attention_snapshot_destroy(ColiV4AttentionSnapshot *snapshot);
-/* ==== end deepseek_v4_attention_transaction.h ==== */
-
-/* ==== begin deepseek_v4_compressor.h ==== */
-
-#include <stddef.h>
-
-/* amalgamated: deepseek_v4_config.h */
-/* amalgamated: deepseek_v4_layer.h */
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-typedef struct ColiDeepSeekV4CompressorState ColiDeepSeekV4CompressorState;
-
-typedef struct {
-    const char *prefix;
-    int head_dimension;
-    int rotate_fp4;
-} ColiDeepSeekV4CompressorOptions;
-
-int coli_v4_compressor_create(ColiDeepSeekV4CompressorState **state,
-                              const ColiDeepSeekV4LayerWeights *weights,
-                              const ColiDeepSeekV4Config *config,
-                              char *error, size_t error_size);
-int coli_v4_compressor_create_with_options(
-    ColiDeepSeekV4CompressorState **state,
-    const ColiDeepSeekV4LayerWeights *weights,
-    const ColiDeepSeekV4Config *config,
-    const ColiDeepSeekV4CompressorOptions *options,
-    char *error, size_t error_size);
-void coli_v4_compressor_reset(ColiDeepSeekV4CompressorState *state);
-int coli_v4_compressor_bind_weights(ColiDeepSeekV4CompressorState *state,
-                                    const ColiDeepSeekV4LayerWeights *weights,
-                                    char *error, size_t error_size);
-void coli_v4_compressor_destroy(ColiDeepSeekV4CompressorState *state);
-
-/* Processes one decode token. produced is set to one only when a complete
- * compression window emits a KV vector. output may be NULL on other steps. */
-int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
-                            float *output, int *produced,
-                            const float *input, int position,
-                            char *error, size_t error_size);
-
-#ifdef __cplusplus
-}
-#endif
-/* ==== end deepseek_v4_compressor.h ==== */
-
-/* ==== begin deepseek_v4_compressor_snapshot.h ==== */
-
-/* amalgamated: deepseek_v4_compressor.h */
-
-typedef struct ColiV4CompressorSnapshot ColiV4CompressorSnapshot;
-
-int coli_v4_compressor_snapshot_create(
-    const ColiDeepSeekV4CompressorState *state,
-    ColiV4CompressorSnapshot **output);
-int coli_v4_compressor_snapshot_restore(
-    ColiDeepSeekV4CompressorState *state,
-    const ColiV4CompressorSnapshot *snapshot);
-void coli_v4_compressor_snapshot_destroy(ColiV4CompressorSnapshot *snapshot);
-/* ==== end deepseek_v4_compressor_snapshot.h ==== */
-
-/* ==== begin deepseek_v4_indexer.h ==== */
-
-#include <stddef.h>
-
-/* amalgamated: deepseek_v4_config.h */
-/* amalgamated: deepseek_v4_layer.h */
-
-typedef struct ColiDeepSeekV4Indexer ColiDeepSeekV4Indexer;
-
-int coli_v4_indexer_create(ColiDeepSeekV4Indexer **state,
-                           const ColiDeepSeekV4LayerWeights *weights,
-                           const ColiDeepSeekV4Config *config,
-                           int max_context, char *error, size_t error_size);
-int coli_v4_indexer_bind_weights(ColiDeepSeekV4Indexer *state,
-                                 const ColiDeepSeekV4LayerWeights *weights,
-                                 char *error, size_t error_size);
-void coli_v4_indexer_reset(ColiDeepSeekV4Indexer *state);
-void coli_v4_indexer_destroy(ColiDeepSeekV4Indexer *state);
-
-/* Updates the overlap compressor, then returns compressed-cache ordinals in
- * descending index score order. query_rank is the normalized q_lora vector. */
-int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
-                         int index_capacity, const float *query_rank,
-                         const float *input, int position,
-                         char *error, size_t error_size);
-const float *coli_v4_indexer_compressed_values(
-    const ColiDeepSeekV4Indexer *state);
-int coli_v4_indexer_compressed_count(const ColiDeepSeekV4Indexer *state);
-/* ==== end deepseek_v4_indexer.h ==== */
-
-/* ==== begin deepseek_v4_indexer_snapshot.h ==== */
-
-/* amalgamated: deepseek_v4_indexer.h */
-
-typedef struct ColiV4IndexerSnapshot ColiV4IndexerSnapshot;
-
-int coli_v4_indexer_snapshot_create(const ColiDeepSeekV4Indexer *state,
-                                    ColiV4IndexerSnapshot **output);
-int coli_v4_indexer_snapshot_restore(ColiDeepSeekV4Indexer *state,
-                                     const ColiV4IndexerSnapshot *snapshot);
-void coli_v4_indexer_snapshot_destroy(ColiV4IndexerSnapshot *snapshot);
-/* ==== end deepseek_v4_indexer_snapshot.h ==== */
-
-/* ==== begin deepseek_v4_expert.h ==== */
-
-#include "expert_store.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
-                               const float *input, float route_weight,
-                               float swiglu_limit);
-
-int coli_v4_shared_expert_forward_ref(float *output,
-                                      const ColiTensorView *gate,
-                                      const ColiTensorView *down,
-                                      const ColiTensorView *up,
-                                      const float *input,
-                                      float swiglu_limit);
-
-#ifdef __cplusplus
-}
-#endif
-/* ==== end deepseek_v4_expert.h ==== */
-
-/* ==== begin deepseek_v4_expert_store.h ==== */
-
-#include <stddef.h>
-#include <stdint.h>
-
-#include "expert_store.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-typedef struct {
-    const char *model_dir;
-    int layers;
-    int experts_per_layer;
-    uint64_t cache_bytes;
-} ColiDeepSeekV4ExpertStoreOptions;
-
-int coli_deepseek_v4_expert_store_open(
-    const ColiDeepSeekV4ExpertStoreOptions *options,
-    ColiExpertStore **store,
-    char *error,
-    size_t error_size);
-
-#ifdef __cplusplus
-}
-#endif
-/* ==== end deepseek_v4_expert_store.h ==== */
-
-/* ==== begin deepseek_v4_block.h ==== */
-
-#include <stddef.h>
-
-/* amalgamated: deepseek_v4_config.h */
-/* amalgamated: deepseek_v4_attention.h */
-/* amalgamated: deepseek_v4_layer.h */
-#include "expert_store.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-int coli_v4_block_token_ref(float *output_hc,
-                            const ColiDeepSeekV4LayerWeights *weights,
-                            const ColiDeepSeekV4Config *config,
-                            ColiExpertStore *experts,
-                            const float *input_hc, int token, int position,
-                            char *error, size_t error_size);
-int coli_v4_block_window_token_ref(
-    float *output_hc, ColiDeepSeekV4WindowAttentionState *attention,
-    const ColiDeepSeekV4LayerWeights *weights,
-    const ColiDeepSeekV4Config *config, ColiExpertStore *experts,
-    const float *input_hc, int token, int position,
-    char *error, size_t error_size);
-
-#ifdef __cplusplus
-}
-#endif
-/* ==== end deepseek_v4_block.h ==== */
-
-/* ==== begin deepseek_v4_block_batch.h ==== */
-
-/* amalgamated: deepseek_v4_attention.h */
-/* amalgamated: deepseek_v4_config.h */
-/* amalgamated: deepseek_v4_layer.h */
-#include "expert_store.h"
-
-int coli_v4_block_window_batch_ref(
-    float *outputs_hc, ColiDeepSeekV4WindowAttentionState *attention,
-    const ColiDeepSeekV4LayerWeights *weights,
-    const ColiDeepSeekV4Config *config, ColiExpertStore *experts,
-    const float *inputs_hc, const int *tokens, int start_position, int batch,
-    char *error, size_t error_size);
-/* ==== end deepseek_v4_block_batch.h ==== */
-
-/* ==== begin deepseek_v4_resource_plan.h ==== */
-
-#include <stddef.h>
-#include <stdint.h>
-
-typedef struct {
-    uint64_t available_bytes;
-    uint64_t user_limit_bytes;
-    uint64_t maximum_layer_bytes;
-    uint64_t runtime_other_bytes;
-    uint64_t expert_record_bytes;
-    int sparse_layers;
-    int routed_topk;
-    int experts_per_layer;
-} ColiDeepSeekV4ResourceInputs;
-
-typedef struct {
-    uint64_t os_available_bytes;
-    uint64_t planner_available_bytes;
-    uint64_t system_reserve_bytes;
-    uint64_t runtime_reserve_bytes;
-    uint64_t minimum_expert_bytes;
-    uint64_t expert_cache_bytes;
-    uint64_t projected_bytes;
-    int slots_per_layer;
-} ColiDeepSeekV4ResourcePlan;
-
-uint64_t coli_v4_os_available_memory(void);
-int coli_v4_resource_plan_compute(
-    ColiDeepSeekV4ResourcePlan *plan,
-    const ColiDeepSeekV4ResourceInputs *inputs,
-    char *error, size_t error_size);
-/* ==== end deepseek_v4_resource_plan.h ==== */
-
-/* ==== begin deepseek_v4_head_cache.h ==== */
-
-#include <stddef.h>
-#include <stdint.h>
-
-int coli_v4_head_cache_probe(const char *model_dir, uint64_t *bytes,
-                             char *error, size_t error_size);
-int coli_v4_head_cache_load(const char *model_dir,
-                            char *error, size_t error_size);
-uint64_t coli_v4_head_cache_bytes(void);
-const void *coli_v4_head_cache_data(int shard, uint64_t offset, size_t length);
-/* ==== end deepseek_v4_head_cache.h ==== */
-
-/* ==== begin deepseek_v4_runtime.h ==== */
-
-#include <stdint.h>
-
-typedef struct {
-    const char *target_model_dir;
-    const char *dspark_model_dir;
-    uint64_t memory_limit_bytes;
-    int context_tokens;
-    int dense_resident;
-    int dspark_resident;
-    uint64_t dspark_expert_cache_bytes;
-    int verify_drafts;
-    int pin_slots_per_layer;
-    uint64_t repin_interval;
-} ColiDeepSeekV4RuntimeOptions;
-
-void coli_v4_runtime_reset(void);
-ColiDeepSeekV4RuntimeOptions *coli_v4_runtime_options(void);
-/* ==== end deepseek_v4_runtime.h ==== */
-
-/* ==== begin deepseek_v4_prompt.h ==== */
-
-#include <stddef.h>
+/* ---- prompt (stable) ---- */
 
 typedef enum {
     COLI_V4_PROMPT_CHAT,
@@ -605,6 +65,95 @@ typedef enum {
 int coli_v4_prompt_build(char **output, size_t *output_length,
                          const char *user_message, const char *system_message,
                          ColiDeepSeekV4PromptMode mode);
-/* ==== end deepseek_v4_prompt.h ==== */
+
+/* ---- engine (stable long-term API) ---- */
+
+typedef struct ColiV4Engine ColiV4Engine;
+typedef struct ColiExpertStore ColiExpertStore;
+typedef struct ColiSafetensorsIndex ColiSafetensorsIndex;
+
+typedef struct {
+    const char *target_model_dir;   /* required */
+    const char *dspark_model_dir;   /* NULL => same as target */
+    uint64_t memory_limit_bytes;    /* 0 => use OS available memory */
+    int context_tokens;             /* 0 => 4096 */
+    int verify_drafts;              /* 0 => runner default */
+    int pin_slots_per_layer;        /* -1 => auto */
+    uint64_t repin_interval;        /* 0 => auto */
+} ColiV4EngineOpenOptions;
+
+typedef struct {
+    uint64_t projected_bytes;
+    uint64_t expert_cache_bytes;
+    int slots_per_layer;
+    int dense_resident;
+    int dspark_resident;
+    int head_resident;
+} ColiV4EngineMemorySummary;
+
+int coli_v4_engine_open(ColiV4Engine **engine,
+                        const ColiV4EngineOpenOptions *options,
+                        char *error, size_t error_size);
+void coli_v4_engine_destroy(ColiV4Engine *engine);
+
+const ColiDeepSeekV4Config *coli_v4_engine_config(const ColiV4Engine *engine);
+ColiSafetensorsIndex *coli_v4_engine_target_index(ColiV4Engine *engine);
+ColiExpertStore *coli_v4_engine_expert_store(ColiV4Engine *engine);
+void coli_v4_engine_memory_summary(const ColiV4Engine *engine,
+                                   ColiV4EngineMemorySummary *summary);
+
+const char *coli_v4_engine_target_model_dir(const ColiV4Engine *engine);
+const char *coli_v4_engine_dspark_model_dir(const ColiV4Engine *engine);
+
+/* ---- session (stable) ---- */
+
+typedef struct ColiV4Session ColiV4Session;
+
+typedef struct {
+    int max_prompt_tokens;   /* 0 => 512 */
+    int max_new_tokens_cap;  /* 0 => 512 */
+} ColiV4SessionCreateOptions;
+
+typedef struct {
+    int max_new_tokens;      /* required; clamped by session cap */
+    int stop_at_sentence;
+    int no_dspark;
+} ColiV4SessionGenerateOptions;
+
+typedef struct {
+    int prompt_tokens;
+    int generated_tokens;
+    int eos_stopped;
+    uint64_t dspark_rounds;
+    uint64_t dspark_proposed;
+    uint64_t dspark_accepted;
+    float dspark_acceptance;
+    double time_to_first_token_sec;
+    double decode_sec;
+} ColiV4SessionGenerateStats;
+
+/* Return non-zero to stop generation. */
+typedef int (*ColiV4SessionTokenFn)(void *user_data, int token, float logit,
+                                    int position, int ordinal);
+
+int coli_v4_session_create(ColiV4Session **session, ColiV4Engine *engine,
+                           const ColiV4SessionCreateOptions *options,
+                           char *error, size_t error_size);
+void coli_v4_session_destroy(ColiV4Session *session);
+
+int coli_v4_session_generate(ColiV4Session *session,
+                             const char *prompt, size_t prompt_length,
+                             const ColiV4SessionGenerateOptions *options,
+                             ColiV4SessionTokenFn on_token, void *user_data,
+                             ColiV4SessionGenerateStats *stats,
+                             char *error, size_t error_size);
+
+int coli_v4_session_generated_text(const ColiV4Session *session,
+                                   char *buffer, size_t buffer_size,
+                                   size_t *out_length);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* COLIBRI_DEEPSEEK_V4_H */

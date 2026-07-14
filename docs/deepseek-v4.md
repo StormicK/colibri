@@ -15,10 +15,14 @@ tiering—end-to-end generation that passes smoke tests.
   cache, and the output head from OS-available memory or `--ram`.
 - **SSD expert streaming**: two coalesced reads per expert (scales + weights);
   no reordered 160 GB container required.
-- **Source layout**: GLM-style amalgams `deepseek_v4.c/.h` and
-  `deepseek_v4_dspark.c/.h`; `make deepseek-v4` builds `c/deepseek_v4.exe`.
+- **Source layout**: GLM-style amalgams `deepseek_v4.c` /
+  `deepseek_v4_dspark.c`; public API in `deepseek_v4.h`
+  (`ColiV4Engine` / `ColiV4Session` / config / prompt); implementation details in
+  `deepseek_v4_internal.h` (not a stability commitment).
+  `make deepseek-v4` builds `c/deepseek_v4.exe`.
 - **CLI**: `c/v4` (Python launcher, stdlib only) wraps `run` / `chat`; inference
-  itself is the native C engine.
+  itself is engine + session (`coli_v4_engine_open` → `coli_v4_session_create` /
+  `generate` → `destroy`).
 
 ## Model snapshot
 
@@ -109,7 +113,7 @@ row as a guarantee for 8 GiB hardware.
 
 Supported platforms for the V4 engine and its amalgam unit tests:
 
-- x86-64 Linux (gcc + GNU ld `--wrap`)
+- x86-64 Linux (gcc; AVX-512 paths when available)
 - Windows / MSYS2 UCRT64 (same)
 
 macOS, PowerPC, and other hosts keep validating GLM via `make check` and do
@@ -177,7 +181,6 @@ cd D:\ai\colibri
 python ./c/v4 run --model D:/ai/DeepSeek-V4-Flash-DSpark --ram 32 `
   --stop-sentence "What is the capital of France?"
 
-python ./c/v4 chat --model D:/ai/DeepSeek-V4-Flash-DSpark --ram 24
 ```
 
 Or call the engine directly:
@@ -200,6 +203,8 @@ Default non-thinking encoding:
 
 ## Todo
 
+- [ ] **session parallel-prefix**: wire `COLI_V4_EXPERIMENTAL_PARALLEL_PREFIX_VERIFY`
+      into `coli_v4_session_generate` (match legacy CLI verify throughput)
 - [ ] **transformers oracle**: prefer `source=transformers` once HF DeepSeek V4
       loads reliably on this checkpoint; keep coli-self for DSpark identity
 - [ ] **16 GiB performance**: close the decode gap vs 32 GiB (cache, pinning, I/O overlap)

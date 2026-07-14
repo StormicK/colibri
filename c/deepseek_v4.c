@@ -6,7 +6,7 @@
 #define coli_v4_layer_load coli_v4_layer_resident_reference_load
 #define coli_v4_layer_free coli_v4_layer_resident_reference_free
 /* ---- begin include deepseek_v4_layer.c ---- */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -180,16 +180,20 @@ int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
     return 0;
 }
 
-void coli_v4_layer_free(ColiDeepSeekV4LayerWeights *weights) {
+void coli_v4_layer_free(ColiV4Engine *engine,
+                        ColiDeepSeekV4LayerWeights *weights) {
+    (void)engine;
     if (!weights) return;
     for (size_t i = 0; i < weights->plan.tensor_count; i++) free(weights->data[i]);
     memset(weights, 0, sizeof(*weights));
 }
 
-int coli_v4_layer_load(ColiDeepSeekV4LayerWeights *weights,
+int coli_v4_layer_load(ColiV4Engine *engine,
+                       ColiDeepSeekV4LayerWeights *weights,
                        const ColiDeepSeekV4Config *config,
                        const ColiSafetensorsIndex *index, int layer,
                        char *error, size_t error_size) {
+    (void)engine;
     if (!weights) return set_error(error, error_size, "missing layer weights output");
     memset(weights, 0, sizeof(*weights));
     if (coli_v4_layer_plan(&weights->plan, config, layer, error, error_size) != 0 ||
@@ -201,11 +205,11 @@ int coli_v4_layer_load(ColiDeepSeekV4LayerWeights *weights,
         const ColiSafetensorsTensor *tensor = coli_st_find(index, spec->name);
         weights->data[i] = malloc((size_t)tensor->nbytes);
         if (!weights->data[i]) {
-            coli_v4_layer_free(weights);
+            coli_v4_layer_free(NULL, weights);
             return set_error(error, error_size, "out of memory loading: %s", spec->name);
         }
         if (coli_st_read_tensor(index, tensor, weights->data[i]) != 0) {
-            coli_v4_layer_free(weights);
+            coli_v4_layer_free(NULL, weights);
             return set_error(error, error_size, "cannot read tensor: %s", spec->name);
         }
     }
@@ -230,67 +234,69 @@ const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
 #undef coli_v4_layer_free
 #undef coli_v4_layer_load
 
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
-enum { COLI_V4_RESIDENT_MAX_LAYERS_V2 = 128 };
-static ColiDeepSeekV4LayerWeights resident_layers_v2[COLI_V4_RESIDENT_MAX_LAYERS_V2];
-static unsigned char resident_ready_v2[COLI_V4_RESIDENT_MAX_LAYERS_V2];
-static const ColiDeepSeekV4Config *resident_config_v2;
-static const ColiSafetensorsIndex *resident_index_v2;
-static uint64_t resident_total_bytes_v2;
+enum { COLI_V4_RESIDENT_MAX_LAYERS_V2 = COLI_V4_RESIDENT_MAX_LAYERS };
 
-static int resident_enabled_v2(void) {
-    return coli_v4_runtime_options()->dense_resident;
+static int resident_enabled_v2(ColiV4Engine *engine) {
+    return engine && engine->runtime.dense_resident;
 }
 
-int coli_v4_layer_load(ColiDeepSeekV4LayerWeights *weights,
+int coli_v4_layer_load(ColiV4Engine *engine,
+                       ColiDeepSeekV4LayerWeights *weights,
                        const ColiDeepSeekV4Config *config,
                        const ColiSafetensorsIndex *index, int layer,
                        char *error, size_t error_size) {
-    if (!resident_enabled_v2())
+    if (!resident_enabled_v2(engine))
         return coli_v4_layer_resident_reference_load(
-            weights, config, index, layer, error, error_size);
-    if (!weights || !config || !index || layer < 0 ||
+            NULL, weights, config, index, layer, error, error_size);
+    if (!engine || !weights || !config || !index || layer < 0 ||
         layer >= config->num_hidden_layers ||
         layer >= COLI_V4_RESIDENT_MAX_LAYERS_V2) return -1;
-    if ((resident_config_v2 && resident_config_v2 != config) ||
-        (resident_index_v2 && resident_index_v2 != index)) {
+    if ((engine->dense_resident.config &&
+         engine->dense_resident.config != config) ||
+        (engine->dense_resident.index &&
+         engine->dense_resident.index != index)) {
         if (error && error_size)
             snprintf(error, error_size,
                      "resident V4 dense cache cannot switch model instances");
         return -1;
     }
-    resident_config_v2 = config; resident_index_v2 = index;
-    if (!resident_ready_v2[layer]) {
+    engine->dense_resident.config = config;
+    engine->dense_resident.index = index;
+    if (!engine->dense_resident.ready[layer]) {
         if (coli_v4_layer_resident_reference_load(
-                &resident_layers_v2[layer], config, index, layer,
-                error, error_size)) return -1;
-        resident_ready_v2[layer] = 1;
-        resident_total_bytes_v2 += resident_layers_v2[layer].stats.total_bytes;
+                NULL, &engine->dense_resident.layers[layer], config, index,
+                layer, error, error_size)) return -1;
+        engine->dense_resident.ready[layer] = 1;
+        engine->dense_resident.total_bytes +=
+            engine->dense_resident.layers[layer].stats.total_bytes;
         if (layer == config->num_hidden_layers - 1)
             fprintf(stderr, "v4_dense_resident layers=%d bytes=%.3fGiB\n",
                     config->num_hidden_layers,
-                    resident_total_bytes_v2 / 1073741824.0);
+                    engine->dense_resident.total_bytes / 1073741824.0);
     }
-    *weights = resident_layers_v2[layer]; return 0;
+    *weights = engine->dense_resident.layers[layer]; return 0;
 }
 
-void coli_v4_layer_free(ColiDeepSeekV4LayerWeights *weights) {
+void coli_v4_layer_free(ColiV4Engine *engine,
+                        ColiDeepSeekV4LayerWeights *weights) {
     if (!weights) return;
     int layer = weights->plan.layer;
-    if (layer >= 0 && layer < COLI_V4_RESIDENT_MAX_LAYERS_V2 &&
-        resident_ready_v2[layer] &&
-        weights->plan.tensor_count == resident_layers_v2[layer].plan.tensor_count &&
-        weights->data[0] == resident_layers_v2[layer].data[0]) {
+    if (engine && layer >= 0 && layer < COLI_V4_RESIDENT_MAX_LAYERS_V2 &&
+        engine->dense_resident.ready[layer] &&
+        weights->plan.tensor_count ==
+            engine->dense_resident.layers[layer].plan.tensor_count &&
+        weights->data[0] == engine->dense_resident.layers[layer].data[0]) {
         memset(weights, 0, sizeof(*weights)); return;
     }
-    coli_v4_layer_resident_reference_free(weights);
+    coli_v4_layer_resident_reference_free(NULL, weights);
 }
 #endif /* COLI_V4_UNIT_LAYER_RESIDENT */
 
 #ifdef COLI_V4_UNIT_RESOURCE_PLAN
 /* ######## deepseek_v4_resource_plan.c ######## */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -414,34 +420,13 @@ int coli_v4_resource_plan_compute(
 
 #ifdef COLI_V4_UNIT_HEAD_CACHE
 /* ######## deepseek_v4_head_cache.c ######## */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "safetensors_index.h"
-
-int __real_coli_st_read_at(const ColiSafetensorsIndex *, int, uint64_t,
-                           size_t, void *);
-
-typedef struct {
-    unsigned char *data;
-    uint64_t bytes;
-    uint64_t offset;
-    int shard;
-    int cleanup_registered;
-} HeadCache;
-
-static HeadCache head_cache;
-
-static void release_head_cache(void) {
-    free(head_cache.data);
-    head_cache.data = NULL;
-    head_cache.bytes = 0;
-    head_cache.offset = 0;
-    head_cache.shard = -1;
-}
 
 static int find_head(const char *model_dir, ColiSafetensorsIndex **index,
                      const ColiSafetensorsTensor **head,
@@ -465,8 +450,12 @@ int coli_v4_head_cache_probe(const char *model_dir, uint64_t *bytes,
     coli_st_index_close(index); return 0;
 }
 
-int coli_v4_head_cache_load(const char *model_dir,
+int coli_v4_head_cache_load(ColiV4Engine *engine, const char *model_dir,
                             char *error, size_t error_size) {
+    if (!engine) {
+        snprintf(error, error_size, "head cache requires a V4 engine");
+        return -1;
+    }
     ColiSafetensorsIndex *index;
     const ColiSafetensorsTensor *head;
     if (find_head(model_dir, &index, &head, error, error_size)) return -1;
@@ -477,39 +466,45 @@ int coli_v4_head_cache_load(const char *model_dir,
         snprintf(error, error_size, "cannot load resident BF16 head.weight");
         return -1;
     }
-    release_head_cache();
-    head_cache.data = data;
-    head_cache.bytes = head->nbytes;
-    head_cache.offset = head->offset;
-    head_cache.shard = head->shard;
-    if (!head_cache.cleanup_registered) {
-        atexit(release_head_cache);
-        head_cache.cleanup_registered = 1;
-    }
+    free(engine->head_cache.data);
+    engine->head_cache.data = data;
+    engine->head_cache.bytes = head->nbytes;
+    engine->head_cache.offset = head->offset;
+    engine->head_cache.shard = head->shard;
     coli_st_index_close(index); return 0;
 }
 
-uint64_t coli_v4_head_cache_bytes(void) { return head_cache.bytes; }
-
-const void *coli_v4_head_cache_data(int shard, uint64_t offset, size_t length) {
-    if (!head_cache.data || shard != head_cache.shard ||
-        offset < head_cache.offset ||
-        offset - head_cache.offset > head_cache.bytes ||
-        length > head_cache.bytes - (offset - head_cache.offset)) return NULL;
-    return head_cache.data + (size_t)(offset - head_cache.offset);
+uint64_t coli_v4_head_cache_bytes(const ColiV4Engine *engine) {
+    return engine ? engine->head_cache.bytes : 0;
 }
 
-int __wrap_coli_st_read_at(const ColiSafetensorsIndex *index, int shard,
+const void *coli_v4_head_cache_data(const ColiV4Engine *engine,
+                                    int shard, uint64_t offset, size_t length) {
+    if (!engine || !engine->head_cache.data || shard != engine->head_cache.shard ||
+        offset < engine->head_cache.offset ||
+        offset - engine->head_cache.offset > engine->head_cache.bytes ||
+        length > engine->head_cache.bytes - (offset - engine->head_cache.offset))
+        return NULL;
+    return engine->head_cache.data +
+           (size_t)(offset - engine->head_cache.offset);
+}
+
+int coli_st_read_at_engine(ColiV4Engine *engine,
+                           const ColiSafetensorsIndex *index, int shard,
                            uint64_t offset, size_t length, void *destination) {
-    if (head_cache.data && destination && shard == head_cache.shard &&
-        offset >= head_cache.offset &&
-        offset - head_cache.offset <= head_cache.bytes &&
-        length <= head_cache.bytes - (offset - head_cache.offset)) {
-        memcpy(destination, head_cache.data + (size_t)(offset - head_cache.offset),
+    if (engine && engine->head_cache.data && destination &&
+        shard == engine->head_cache.shard &&
+        offset >= engine->head_cache.offset &&
+        offset - engine->head_cache.offset <= engine->head_cache.bytes &&
+        length <= engine->head_cache.bytes -
+                      (offset - engine->head_cache.offset)) {
+        memcpy(destination,
+               engine->head_cache.data +
+                   (size_t)(offset - engine->head_cache.offset),
                length);
         return 0;
     }
-    return __real_coli_st_read_at(index, shard, offset, length, destination);
+    return coli_st_read_at(index, shard, offset, length, destination);
 }
 #endif /* COLI_V4_UNIT_HEAD_CACHE */
 
@@ -517,28 +512,18 @@ int __wrap_coli_st_read_at(const ColiSafetensorsIndex *index, int shard,
 /* ######## deepseek_v4_expert_store_auto.c ######## */
 #include "deepseek_v4_dspark.h"
 /* ---- begin inlined deepseek_v4_expert_store_auto_v5.c ---- */
-#define __wrap_coli_deepseek_v4_expert_store_open \
-    coli_v4_expert_store_auto_v1_unused
-/* ---- begin inlined deepseek_v4_expert_store_auto.c ---- */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
+#include "deepseek_v4_dspark.h"
 #include "safetensors_index.h"
 
 #define MIB UINT64_C(1048576)
 #define GIB UINT64_C(1073741824)
-
-int __real_coli_deepseek_v4_expert_store_open(
-    const ColiDeepSeekV4ExpertStoreOptions *, ColiExpertStore **,
-    char *, size_t);
-
 
 static uint64_t expert_record_bytes(const ColiSafetensorsIndex *index) {
     static const char *parts[] = {
@@ -570,11 +555,16 @@ static uint64_t context_bytes(const ColiDeepSeekV4Config *config, int context) {
     return total;
 }
 
-static int build_runtime_plan(const ColiDeepSeekV4ExpertStoreOptions *options,
+static int build_runtime_plan(ColiV4Engine *engine,
+                              const ColiDeepSeekV4ExpertStoreOptions *options,
                               ColiDeepSeekV4ResourcePlan *plan,
                               char *error, size_t error_size) {
     ColiDeepSeekV4Config config;
     ColiSafetensorsIndex *index = NULL;
+    if (!engine) {
+        snprintf(error, error_size, "V4 runtime requires an engine");
+        return -1;
+    }
     if (coli_v4_config_load(&config, options->model_dir, error, error_size) ||
         coli_st_index_open(&index, options->model_dir, error, error_size))
         return -1;
@@ -596,7 +586,7 @@ static int build_runtime_plan(const ColiDeepSeekV4ExpertStoreOptions *options,
         snprintf(error, error_size, "cannot determine V4 expert record size");
         return -1;
     }
-    ColiDeepSeekV4RuntimeOptions *runtime = coli_v4_runtime_options();
+    ColiDeepSeekV4RuntimeOptions *runtime = &engine->runtime;
     int context = runtime->context_tokens;
     if (context > config.max_position_embeddings)
         context = config.max_position_embeddings;
@@ -616,41 +606,6 @@ static int build_runtime_plan(const ColiDeepSeekV4ExpertStoreOptions *options,
     };
     return coli_v4_resource_plan_compute(plan, &inputs, error, error_size);
 }
-
-int __wrap_coli_deepseek_v4_expert_store_open(
-    const ColiDeepSeekV4ExpertStoreOptions *options, ColiExpertStore **output,
-    char *error, size_t error_size) {
-    if (!options) return -1;
-    ColiDeepSeekV4ResourcePlan plan;
-    if (build_runtime_plan(options, &plan, error, error_size)) return -1;
-
-    ColiDeepSeekV4ExpertStoreOptions automatic = *options;
-    automatic.cache_bytes = plan.expert_cache_bytes;
-    fprintf(stderr,
-        "ram_plan available=%.2fGiB reserve=%.2fGiB runtime=%.2fGiB "
-        "expert_min=%.2fGiB expert_cache=%.2fGiB slots_per_layer=%d "
-        "head=streamed-bf16 projected=%.2fGiB\n",
-        plan.os_available_bytes / (double)GIB,
-        plan.system_reserve_bytes / (double)GIB,
-        plan.runtime_reserve_bytes / (double)GIB,
-        plan.minimum_expert_bytes / (double)GIB,
-        automatic.cache_bytes / (double)GIB,
-        (int)(automatic.cache_bytes /
-              (plan.minimum_expert_bytes / plan.slots_per_layer)),
-        (plan.system_reserve_bytes + plan.runtime_reserve_bytes +
-         automatic.cache_bytes) / (double)GIB);
-    return __real_coli_deepseek_v4_expert_store_open(
-        &automatic, output, error, error_size);
-}
-/* ---- end inlined deepseek_v4_expert_store_auto.c ---- */
-
-#undef __wrap_coli_deepseek_v4_expert_store_open
-
-#include <time.h>
-
-#include "deepseek_v4_dspark.h"
-#include "deepseek_v4.h"
-
 
 static int v5_dense_inventory(const char *model_dir,
                               uint64_t *bytes,
@@ -672,13 +627,14 @@ static int v5_dense_inventory(const char *model_dir,
     coli_st_index_close(index); *bytes = total; return 0;
 }
 
-int __wrap_coli_deepseek_v4_expert_store_open(
+int coli_v4_expert_store_open_planned(
+    ColiV4Engine *engine,
     const ColiDeepSeekV4ExpertStoreOptions *options, ColiExpertStore **output,
     char *error, size_t error_size) {
-    if (!options) return -1;
+    if (!options || !engine) return -1;
     ColiDeepSeekV4ResourcePlan plan;
-    ColiDeepSeekV4RuntimeOptions *runtime = coli_v4_runtime_options();
-    if (build_runtime_plan(options, &plan, error, error_size)) return -1;
+    ColiDeepSeekV4RuntimeOptions *runtime = &engine->runtime;
+    if (build_runtime_plan(engine, options, &plan, error, error_size)) return -1;
     uint64_t per_slot = plan.expert_cache_bytes /
                         (uint64_t)plan.slots_per_layer;
     uint64_t head_bytes = 0, dense_bytes = 0;
@@ -752,7 +708,7 @@ int __wrap_coli_deepseek_v4_expert_store_open(
     plan.projected_bytes = fixed + dense_bytes + dspark_bytes +
         plan.expert_cache_bytes + (resident_head ? head_bytes : 0);
     if (resident_head && coli_v4_head_cache_load(
-            options->model_dir, error, error_size)) return -1;
+            engine, options->model_dir, error, error_size)) return -1;
     fprintf(stderr,
         "ram_tiers available=%.2fGiB dense=%s(%.2fGiB) "
         "dspark=%s(%.2fGiB) dspark_experts=%.2fGiB "
@@ -766,7 +722,9 @@ int __wrap_coli_deepseek_v4_expert_store_open(
         plan.projected_bytes / (double)GIB);
     ColiDeepSeekV4ExpertStoreOptions automatic = *options;
     automatic.cache_bytes = plan.expert_cache_bytes;
-    return __real_coli_deepseek_v4_expert_store_open(
+    automatic.pin_slots_per_layer = runtime->pin_slots_per_layer;
+    automatic.repin_interval = runtime->repin_interval;
+    return coli_deepseek_v4_expert_store_open(
         &automatic, output, error, error_size);
 }
 /* ---- end inlined deepseek_v4_expert_store_auto_v5.c ---- */
@@ -774,7 +732,7 @@ int __wrap_coli_deepseek_v4_expert_store_open(
 
 #ifdef COLI_V4_UNIT_MATH
 /* ######## deepseek_v4_math.c ######## */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -1079,7 +1037,7 @@ int coli_v4_swiglu(float *output, const float *gate, const float *up,
 
 #ifdef COLI_V4_UNIT_ATTENTION
 /* ######## deepseek_v4_attention.c ######## */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -1088,10 +1046,10 @@ int coli_v4_swiglu(float *output, const float *gate, const float *up,
 #include <stdlib.h>
 #include <string.h>
 
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
 #include "native_quant.h"
 
 static int set_error(char *error, size_t size, const char *format, ...);
@@ -1475,7 +1433,7 @@ int coli_v4_attention_window_token_ref(
 #define coli_v4_attention_token_ref coli_v4_attention_token_batch_serial_copy
 #define coli_v4_attention_window_token_ref coli_v4_attention_window_token_batch_serial_copy
 /* ---- begin include deepseek_v4_attention.c ---- */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -1484,10 +1442,10 @@ int coli_v4_attention_window_token_ref(
 #include <stdlib.h>
 #include <string.h>
 
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
 #include "native_quant.h"
 
 static int set_error(char *error, size_t size, const char *format, ...);
@@ -1869,7 +1827,7 @@ int coli_v4_attention_window_token_ref(
 #undef coli_v4_attention_token_ref
 #undef coli_v4_attention_window_token_ref
 
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 #include "native_quant_batch.h"
 
 int coli_v4_attention_window_batch_ref(
@@ -2109,7 +2067,7 @@ int coli_v4_attention_window_batch_ref(
 
 #ifdef COLI_V4_UNIT_COMPRESSOR
 /* ######## deepseek_v4_compressor.c ######## */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -2118,7 +2076,7 @@ int coli_v4_attention_window_batch_ref(
 #include <stdlib.h>
 #include <string.h>
 
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 #include "native_quant.h"
 
 struct ColiDeepSeekV4CompressorState {
@@ -2366,7 +2324,7 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
 
 #ifdef COLI_V4_UNIT_INDEXER
 /* ######## deepseek_v4_indexer.c ######## */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -2375,8 +2333,8 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
 #include <stdlib.h>
 #include <string.h>
 
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
 #include "native_quant.h"
 
 struct ColiDeepSeekV4Indexer {
@@ -2617,7 +2575,7 @@ int coli_v4_indexer_compressed_count(const ColiDeepSeekV4Indexer *state) {
 
 #ifdef COLI_V4_UNIT_SPARSE_ATTENTION
 /* ######## deepseek_v4_sparse_attention.c ######## */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -2699,7 +2657,7 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
 #define coli_v4_block_token_ref coli_v4_block_token_serial_ref
 #define coli_v4_block_window_token_ref coli_v4_block_window_token_serial_ref
 /* ---- begin include deepseek_v4_block.c ---- */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -2707,9 +2665,9 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
 #include <stdlib.h>
 #include <string.h>
 
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
 #include "native_quant.h"
 
 static int set_error(char *error, size_t size, const char *format, ...) {
@@ -3531,8 +3489,8 @@ int coli_v4_block_window_token_ref(
 /* ---- end include deepseek_v4_block_pipeline.c ---- */
 
 
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
 
 int coli_v4_block_window_batch_ref(
     float *outputs_hc, ColiDeepSeekV4WindowAttentionState *attention,
@@ -3607,7 +3565,7 @@ int coli_v4_block_window_batch_ref(
 #define coli_v4_compressor_destroy snapshot_copy_compressor_destroy
 #define coli_v4_compressor_step snapshot_copy_compressor_step
 /* ---- begin include deepseek_v4_compressor.c ---- */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -3616,7 +3574,7 @@ int coli_v4_block_window_batch_ref(
 #include <stdlib.h>
 #include <string.h>
 
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 #include "native_quant.h"
 
 struct ColiDeepSeekV4CompressorState {
@@ -3869,7 +3827,7 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
 #undef coli_v4_compressor_create_with_options
 #undef coli_v4_compressor_create
 
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 struct ColiV4CompressorSnapshot {
     size_t count;
@@ -3923,7 +3881,7 @@ void coli_v4_compressor_snapshot_destroy(ColiV4CompressorSnapshot *snapshot) {
 #define coli_v4_indexer_compressed_values snapshot_copy_indexer_values
 #define coli_v4_indexer_compressed_count snapshot_copy_indexer_count
 /* ---- begin include deepseek_v4_indexer.c ---- */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -3932,8 +3890,8 @@ void coli_v4_compressor_snapshot_destroy(ColiV4CompressorSnapshot *snapshot) {
 #include <stdlib.h>
 #include <string.h>
 
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
 #include "native_quant.h"
 
 struct ColiDeepSeekV4Indexer {
@@ -4180,8 +4138,8 @@ int coli_v4_indexer_compressed_count(const ColiDeepSeekV4Indexer *state) {
 #undef coli_v4_indexer_bind_weights
 #undef coli_v4_indexer_create
 
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
 
 struct ColiV4IndexerSnapshot {
     int count;
@@ -4241,7 +4199,7 @@ void coli_v4_indexer_snapshot_destroy(ColiV4IndexerSnapshot *snapshot) {
 #define coli_v4_attention_token_ref transaction_copy_attention_token
 #define coli_v4_attention_window_token_ref transaction_copy_attention_window_token
 /* ---- begin include deepseek_v4_attention.c ---- */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -4250,10 +4208,10 @@ void coli_v4_indexer_snapshot_destroy(ColiV4IndexerSnapshot *snapshot) {
 #include <stdlib.h>
 #include <string.h>
 
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
 #include "native_quant.h"
 
 static int set_error(char *error, size_t size, const char *format, ...);
@@ -4635,9 +4593,9 @@ int coli_v4_attention_window_token_ref(
 #undef coli_v4_window_attention_reset
 #undef coli_v4_window_attention_create
 
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
 
 struct ColiV4AttentionSnapshot {
     int window_size, head_dim, compressed_count;
@@ -4712,8 +4670,9 @@ void coli_v4_attention_snapshot_destroy(ColiV4AttentionSnapshot *snapshot) {
     coli_deepseek_v4_expert_store_open_base
 /* ---- begin include deepseek_v4_expert_store.c ---- */
 #define _GNU_SOURCE
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
+#include <assert.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -4757,6 +4716,7 @@ typedef struct {
     V4ExpertRecord *records;
     V4ExpertSlot *slots;
     uint64_t clock;
+    unsigned active_leases;
     ColiExpertStoreStats stats;
     pthread_mutex_t mutex;
 } V4ExpertStoreState;
@@ -4864,10 +4824,16 @@ static void fill_tensor_view(ColiTensorView *view,
 
 static int lookup(ColiExpertStore *store, ColiExpertKey key,
                   ColiExpertView *view) {
-    if (!store || !store->state || !view) return -1;
+    if (!store || !store->state || !view) {
+        if (view) memset(view, 0, sizeof(*view));
+        return -1;
+    }
     V4ExpertStoreState *state = store->state;
     V4ExpertRecord *record = get_record(state, key);
-    if (!record) return -1;
+    if (!record) {
+        memset(view, 0, sizeof(*view));
+        return -1;
+    }
     pthread_mutex_lock(&state->mutex);
     state->stats.requests++;
     V4ExpertSlot *slots = layer_slots(state, key.layer);
@@ -4887,12 +4853,14 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         }
         if (!slot) {
             pthread_mutex_unlock(&state->mutex);
+            memset(view, 0, sizeof(*view));
             return -1;
         }
         if (!slot->slab) {
             slot->slab = malloc((size_t)state->record_bytes);
             if (!slot->slab) {
                 pthread_mutex_unlock(&state->mutex);
+                memset(view, 0, sizeof(*view));
                 return -1;
             }
             state->stats.resident_bytes += state->record_bytes;
@@ -4905,6 +4873,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
                             (size_t)record->weight_bytes,
                             slot->slab + record->scale_bytes) != 0) {
             pthread_mutex_unlock(&state->mutex);
+            memset(view, 0, sizeof(*view));
             return -1;
         }
         slot->expert = key.expert;
@@ -4912,6 +4881,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         state->stats.bytes_read += record->record_bytes;
     }
     slot->references++;
+    state->active_leases++;
     slot->used = ++state->clock;
     memset(view, 0, sizeof(*view));
     view->key = key;
@@ -4924,13 +4894,17 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
 }
 
 static void release(ColiExpertStore *store, ColiExpertView *view) {
-    if (!store || !store->state || !view || !view->lease) return;
+    if (!store || !store->state || !view || !view->lease) {
+        if (view) memset(view, 0, sizeof(*view));
+        return;
+    }
     V4ExpertStoreState *state = store->state;
     V4ExpertSlot *slot = view->lease;
     pthread_mutex_lock(&state->mutex);
     if (slot->references) slot->references--;
-    view->lease = NULL;
+    if (state->active_leases) state->active_leases--;
     pthread_mutex_unlock(&state->mutex);
+    memset(view, 0, sizeof(*view));
 }
 
 static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
@@ -5000,6 +4974,7 @@ static void destroy(ColiExpertStore *store) {
     if (!store) return;
     V4ExpertStoreState *state = store->state;
     if (state) {
+        assert(state->active_leases == 0 && "destroy with active expert leases");
         for (int i = 0; i < state->layers * state->slots_per_layer; i++)
             free(state->slots[i].slab);
         pthread_mutex_destroy(&state->mutex);
@@ -5097,7 +5072,7 @@ fail:
 
 #include "native_quant_fp4_rows16.h"
 
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 typedef struct V4HotPolicy {
     ColiExpertStore *store;
@@ -5239,11 +5214,17 @@ static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
 
 static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
                       ColiExpertView *view) {
-    if (!store || !store->state || !view) return -1;
+    if (!store || !store->state || !view) {
+        if (view) memset(view, 0, sizeof(*view));
+        return -1;
+    }
     V4ExpertStoreState *state = store->state;
     V4ExpertRecord *record = get_record(state, key);
     V4HotPolicy *policy = hot_find(store);
-    if (!record || !policy) return -1;
+    if (!record || !policy) {
+        memset(view, 0, sizeof(*view));
+        return -1;
+    }
     pthread_mutex_lock(&state->mutex);
     state->stats.requests++;
     policy->usage[(size_t)key.layer * state->experts_per_layer + key.expert]++;
@@ -5257,6 +5238,7 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     for (int i = 0; i < state->slots_per_layer; i++) {
         if (slots[i].slab && slots[i].expert == key.expert) {
             slot = &slots[i]; slot->references++;
+            state->active_leases++;
             slot->used = ++state->clock; state->stats.hits++;
             if (hot_is_pinned(policy, key.layer, key.expert))
                 hot_pack_slot_locked(policy, state, record, slot);
@@ -5279,14 +5261,24 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         for (int i = 0; i < state->slots_per_layer; i++)
             if (!slots[i].references && (!slot || slots[i].used < slot->used))
                 slot = &slots[i];
-    if (!slot) { pthread_mutex_unlock(&state->mutex); return -1; }
+    if (!slot) {
+        pthread_mutex_unlock(&state->mutex);
+        memset(view, 0, sizeof(*view));
+        return -1;
+    }
     if (!slot->slab) {
         slot->slab = malloc((size_t)state->record_bytes);
-        if (!slot->slab) { pthread_mutex_unlock(&state->mutex); return -1; }
+        if (!slot->slab) {
+            pthread_mutex_unlock(&state->mutex);
+            memset(view, 0, sizeof(*view));
+            return -1;
+        }
         state->stats.resident_bytes += state->record_bytes;
     }
     policy->packed[hot_slot_index(state, slot)] = 0;
-    slot->expert = -1; slot->references = 1; slot->used = ++state->clock;
+    slot->expert = -1; slot->references = 1;
+    state->active_leases++;
+    slot->used = ++state->clock;
     pthread_mutex_unlock(&state->mutex);
     int read_result = coli_st_read_at(
         state->index, record->shard, record->scale_offset,
@@ -5297,7 +5289,10 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     pthread_mutex_lock(&state->mutex);
     if (read_result) {
         slot->references = 0; slot->expert = -1;
-        pthread_mutex_unlock(&state->mutex); return -1;
+        if (state->active_leases) state->active_leases--;
+        pthread_mutex_unlock(&state->mutex);
+        memset(view, 0, sizeof(*view));
+        return -1;
     }
     slot->expert = key.expert; slot->used = ++state->clock;
     state->stats.misses++; state->stats.bytes_read += record->record_bytes;
@@ -5349,9 +5344,10 @@ int COLI_V4_ROWS16_STORE_OPEN(
 #endif
     if (maximum_pins > COLI_V4_MAX_PIN_SLOTS_PER_LAYER)
         maximum_pins = COLI_V4_MAX_PIN_SLOTS_PER_LAYER;
-    ColiDeepSeekV4RuntimeOptions *runtime = coli_v4_runtime_options();
-    uint64_t requested = runtime->pin_slots_per_layer >= 0
-        ? (uint64_t)runtime->pin_slots_per_layer
+    int pin_requested = options->pin_slots_per_layer;
+    /* -1 / 0 => implementation default (use maximum_pins). */
+    uint64_t requested = pin_requested > 0
+        ? (uint64_t)pin_requested
         : (uint64_t)(maximum_pins > 0 ? maximum_pins : 0);
     int pin_count = requested > (uint64_t)maximum_pins
         ? maximum_pins : (int)requested;
@@ -5375,8 +5371,8 @@ int COLI_V4_ROWS16_STORE_OPEN(
     }
     for (size_t i = 0; i < pins; i++) policy->pins[i] = -1;
     policy->store = *output; policy->pin_count = pin_count;
-    policy->repin_interval = runtime->repin_interval
-        ? runtime->repin_interval : (uint64_t)minimum_slots;
+    policy->repin_interval = options->repin_interval
+        ? options->repin_interval : (uint64_t)minimum_slots;
     if (!policy->repin_interval) policy->repin_interval = 1;
     pthread_mutex_lock(&hot_policies_mutex);
     policy->next = hot_policies; hot_policies = policy;
@@ -5394,11 +5390,11 @@ int COLI_V4_ROWS16_STORE_OPEN(
 /* ######## deepseek_v4_expert_rows16.c ######## */
 #define coli_v4_expert_forward_ref coli_v4_expert_forward_v17_fallback
 /* ---- begin include deepseek_v4_expert_dual.c ---- */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <stdlib.h>
 
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 #include "native_quant.h"
 #include "native_quant_dual.h"
 
@@ -5592,28 +5588,158 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
 #endif /* COLI_V4_UNIT_ROUTE_BF16 */
 
 #ifdef COLI_V4_UNIT_RUNTIME
-/* ######## deepseek_v4_runtime.c ######## */
-#include "deepseek_v4.h"
+/* ######## deepseek_v4_runtime.c / engine ######## */
+#include "deepseek_v4_internal.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-static ColiDeepSeekV4RuntimeOptions runtime_options;
+/* Provided by LAYER_RESIDENT / DSPARK heads units. */
+void coli_v4_layer_resident_reference_free(ColiV4Engine *engine,
+                                           ColiDeepSeekV4LayerWeights *weights);
+void coli_v4_dspark_heads_close(ColiV4DSparkHeads *heads);
 
-void coli_v4_runtime_reset(void) {
-    memset(&runtime_options, 0, sizeof(runtime_options));
-    runtime_options.context_tokens = 4096;
-    runtime_options.pin_slots_per_layer = -1;
+const ColiDeepSeekV4Config *coli_v4_engine_config(const ColiV4Engine *engine) {
+    return engine ? &engine->config : NULL;
 }
 
-ColiDeepSeekV4RuntimeOptions *coli_v4_runtime_options(void) {
-    if (!runtime_options.context_tokens) coli_v4_runtime_reset();
-    return &runtime_options;
+ColiSafetensorsIndex *coli_v4_engine_target_index(ColiV4Engine *engine) {
+    return engine ? engine->target_index : NULL;
+}
+
+ColiExpertStore *coli_v4_engine_expert_store(ColiV4Engine *engine) {
+    return engine ? engine->experts : NULL;
+}
+
+void coli_v4_engine_memory_summary(const ColiV4Engine *engine,
+                                   ColiV4EngineMemorySummary *summary) {
+    if (!summary) return;
+    if (!engine) {
+        memset(summary, 0, sizeof(*summary));
+        return;
+    }
+    *summary = engine->summary;
+}
+
+const char *coli_v4_engine_target_model_dir(const ColiV4Engine *engine) {
+    return engine ? engine->runtime.target_model_dir : NULL;
+}
+
+const char *coli_v4_engine_dspark_model_dir(const ColiV4Engine *engine) {
+    return engine ? engine->runtime.dspark_model_dir : NULL;
+}
+
+void coli_v4_engine_destroy(ColiV4Engine *engine) {
+    if (!engine) return;
+
+    /* DSpark capture (heads owned by engine; runners must not free them). */
+    if (engine->dspark_capture.heads) {
+        coli_v4_dspark_heads_close(engine->dspark_capture.heads);
+        engine->dspark_capture.heads = NULL;
+    }
+    for (int i = 0; i < COLI_V4_DSPARK_MAX_TARGETS; i++) {
+        free(engine->dspark_capture.states[i]);
+        engine->dspark_capture.states[i] = NULL;
+    }
+    free(engine->dspark_capture.staged_main_x);
+    engine->dspark_capture.staged_main_x = NULL;
+    engine->dspark_capture.capacity = 0;
+    engine->dspark_capture.staged_batch = 0;
+    engine->dspark_capture.staged_hidden = 0;
+    memset(&engine->dspark_capture.manifest, 0,
+           sizeof(engine->dspark_capture.manifest));
+
+    memset(&engine->dspark_verify, 0, sizeof(engine->dspark_verify));
+
+    for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS; layer++) {
+        if (!engine->dense_resident.ready[layer]) continue;
+        coli_v4_layer_resident_reference_free(
+            NULL, &engine->dense_resident.layers[layer]);
+        engine->dense_resident.ready[layer] = 0;
+    }
+    engine->dense_resident.config = NULL;
+    engine->dense_resident.index = NULL;
+    engine->dense_resident.total_bytes = 0;
+
+    for (int stage = 0; stage < COLI_V4_DSPARK_MAX_STAGES; stage++) {
+        if (!engine->dspark_resident.ready[stage]) continue;
+        coli_v4_layer_resident_reference_free(
+            NULL, &engine->dspark_resident.layers[stage]);
+        engine->dspark_resident.ready[stage] = 0;
+    }
+    engine->dspark_resident.index = NULL;
+    engine->dspark_resident.total_bytes = 0;
+
+    free(engine->head_cache.data);
+    engine->head_cache.data = NULL;
+    if (engine->owns_experts && engine->experts && engine->experts->ops &&
+        engine->experts->ops->destroy)
+        engine->experts->ops->destroy(engine->experts);
+    engine->experts = NULL;
+    if (engine->owns_index && engine->target_index)
+        coli_st_index_close(engine->target_index);
+    engine->target_index = NULL;
+    free(engine);
+}
+
+int coli_v4_engine_open(ColiV4Engine **output,
+                        const ColiV4EngineOpenOptions *options,
+                        char *error, size_t error_size) {
+    if (!output || !options || !options->target_model_dir) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid V4 engine open options");
+        return -1;
+    }
+    *output = NULL;
+    ColiV4Engine *engine = calloc(1, sizeof(*engine));
+    if (!engine) {
+        if (error && error_size)
+            snprintf(error, error_size, "out of memory creating V4 engine");
+        return -1;
+    }
+    engine->runtime.target_model_dir = options->target_model_dir;
+    engine->runtime.dspark_model_dir = options->dspark_model_dir
+        ? options->dspark_model_dir : options->target_model_dir;
+    engine->runtime.memory_limit_bytes = options->memory_limit_bytes;
+    engine->runtime.context_tokens =
+        options->context_tokens > 0 ? options->context_tokens : 4096;
+    engine->runtime.verify_drafts = options->verify_drafts;
+    engine->runtime.repin_interval = options->repin_interval;
+    engine->runtime.pin_slots_per_layer = options->pin_slots_per_layer;
+
+    if (coli_v4_config_load(&engine->config, options->target_model_dir,
+                            error, error_size) ||
+        coli_st_index_open(&engine->target_index, options->target_model_dir,
+                           error, error_size) ||
+        coli_v4_expert_store_open_planned(
+            engine,
+            &(ColiDeepSeekV4ExpertStoreOptions){
+                options->target_model_dir,
+                engine->config.num_hidden_layers,
+                engine->config.n_routed_experts,
+                4ULL << 30,
+                engine->runtime.pin_slots_per_layer,
+                engine->runtime.repin_interval},
+            &engine->experts, error, error_size)) {
+        coli_v4_engine_destroy(engine);
+        return -1;
+    }
+    engine->owns_index = 1;
+    engine->owns_experts = 1;
+    engine->summary.dense_resident = engine->runtime.dense_resident;
+    engine->summary.dspark_resident = engine->runtime.dspark_resident;
+    engine->summary.head_resident = engine->head_cache.data != NULL;
+    engine->summary.expert_cache_bytes =
+        engine->runtime.dspark_expert_cache_bytes;
+    *output = engine;
+    return 0;
 }
 #endif /* COLI_V4_UNIT_RUNTIME */
 
 #ifdef COLI_V4_UNIT_PROMPT
 /* ######## deepseek_v4_prompt.c ######## */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -5693,11 +5819,11 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 #include <stdlib.h>
 #include <string.h>
 
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
 #include "json.h"
 #include "native_quant.h"
 #include "safetensors_index.h"
@@ -5767,7 +5893,8 @@ static int final_hidden(float *output, const float *state,
     return 0;
 }
 
-static int head_argmax(const float *hidden, const ColiSafetensorsIndex *index,
+static int head_argmax(ColiV4Engine *engine, const float *hidden,
+                       const ColiSafetensorsIndex *index,
                        const ColiDeepSeekV4Config *config,
                        int *best_token, float *best_logit) {
     const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
@@ -5784,9 +5911,10 @@ static int head_argmax(const float *hidden, const ColiSafetensorsIndex *index,
     for (int start = 0; start < vocab; start += ROWS) {
         int rows = vocab - start < ROWS ? vocab - start : ROWS;
         size_t bytes = (size_t)rows * d * sizeof(*raw);
-        if (coli_st_read_at(index, head->shard,
-                            head->offset + (uint64_t)start * d * sizeof(*raw),
-                            bytes, raw)) {
+        if (coli_st_read_at_engine(
+                engine, index, head->shard,
+                head->offset + (uint64_t)start * d * sizeof(*raw),
+                bytes, raw)) {
             free(scores); free(raw);
             return -1;
         }
@@ -5850,7 +5978,7 @@ int main(int argc, char **argv) {
         coli_deepseek_v4_expert_store_open(
             &(ColiDeepSeekV4ExpertStoreOptions){
                 argv[1], config.num_hidden_layers, config.n_routed_experts,
-                UINT64_C(4) * 1024 * 1024 * 1024,
+                UINT64_C(4) * 1024 * 1024 * 1024, -1, 0,
             }, &experts, error, sizeof(error))) {
         fprintf(stderr, "%s\n", error);
         return 1;
@@ -5892,7 +6020,7 @@ int main(int argc, char **argv) {
         if (load_embedding(state, index, &config, current_token)) return 1;
         for (int layer_id = 0; layer_id < config.num_hidden_layers; layer_id++) {
             ColiDeepSeekV4LayerWeights layer;
-            if (coli_v4_layer_load(&layer, &config, index, layer_id,
+            if (coli_v4_layer_load(NULL, &layer, &config, index, layer_id,
                                    error, sizeof(error)) ||
                 coli_v4_block_window_token_ref(
                     next, attention[layer_id], &layer, &config, experts, state,
@@ -5901,7 +6029,7 @@ int main(int argc, char **argv) {
                         position, layer_id, error);
                 return 1;
             }
-            coli_v4_layer_free(&layer);
+            coli_v4_layer_free(NULL, &layer);
             float *swap = state; state = next; next = swap;
         }
         fprintf(stderr, "position %d/%d complete (%d layers)\n", position,
@@ -5912,7 +6040,7 @@ int main(int argc, char **argv) {
         }
         int output_token;
         float output_logit;
-        if (head_argmax(hidden, index, &config, &output_token, &output_logit)) {
+        if (head_argmax(NULL, hidden, index, &config, &output_token, &output_logit)) {
             fprintf(stderr, "lm_head failed\n");
             return 1;
         }
@@ -5970,7 +6098,7 @@ int main(int argc, char **argv) {
 
 #undef main
 
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 #include "deepseek_v4_dspark.h"
 #include "deepseek_v4_dspark.h"
 #include "deepseek_v4_dspark.h"
@@ -6010,7 +6138,7 @@ static int spec_print(Tok *tokenizer, int token, float logit,
 }
 #endif
 
-static int target_batch(float **state_ptr, float **next_ptr,
+static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                         ColiDeepSeekV4WindowAttentionState **attention,
                         const ColiSafetensorsIndex *index,
                         const ColiDeepSeekV4Config *config,
@@ -6019,19 +6147,22 @@ static int target_batch(float **state_ptr, float **next_ptr,
     float *state = *state_ptr, *next = *next_ptr;
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
-        if (coli_v4_layer_load(&layer, config, index, layer_id,
+        if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
                                error, error_size)) return -1;
         int result = coli_v4_block_window_batch_ref(
             next, attention[layer_id], &layer, config, experts,
             state, tokens, start, batch, error, error_size);
-        coli_v4_layer_free(&layer);
+        if (!result)
+            coli_v4_dspark_capture_after_block(engine, &layer, config, next,
+                                               batch);
+        coli_v4_layer_free(engine, &layer);
         if (result) return -1;
         float *swap = state; state = next; next = swap;
     }
     *state_ptr = state; *next_ptr = next; return 0;
 }
 
-static int target_token(float **state_ptr, float **next_ptr,
+static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                         ColiDeepSeekV4WindowAttentionState **attention,
                         const ColiSafetensorsIndex *index,
                         const ColiDeepSeekV4Config *config,
@@ -6041,12 +6172,14 @@ static int target_token(float **state_ptr, float **next_ptr,
     if (load_embedding(state, index, config, token)) return -1;
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
-        if (coli_v4_layer_load(&layer, config, index, layer_id,
+        if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
                                error, error_size)) return -1;
         int result = coli_v4_block_window_token_ref(
             next, attention[layer_id], &layer, config, experts,
             state, token, position, error, error_size);
-        coli_v4_layer_free(&layer);
+        if (!result)
+            coli_v4_dspark_capture_after_block(engine, &layer, config, next, 1);
+        coli_v4_layer_free(engine, &layer);
         if (result) return -1;
         float *swap = state; state = next; next = swap;
     }
@@ -6122,13 +6255,13 @@ int COLI_V4_GENERATE_MAIN(int argc, char **argv) {
                            prompt_ids[item])) return 1;
 
     double started = spec_now();
-    if (target_batch(&state, &next, attention, index, &config, experts,
+    if (target_batch(NULL, &state, &next, attention, index, &config, experts,
                      prompt_ids, 0, prompt_count, error, sizeof(error)) ||
-        coli_v4_dspark_capture_main_x(main_x_batch, prompt_count, &config) ||
-        coli_v4_dspark_runner_open(&runner, argv[2], argv[1], &config,
+        coli_v4_dspark_capture_main_x(NULL, main_x_batch, prompt_count, &config) ||
+        coli_v4_dspark_runner_open(&runner, NULL, argv[2], argv[1], &config,
                                    256ULL << 20, error, sizeof(error)) ||
         coli_v4_dspark_runner_use_shared_heads(
-            runner, coli_v4_dspark_capture_heads()) ||
+            runner, coli_v4_dspark_capture_heads(NULL)) ||
         coli_v4_dspark_runner_prefill(runner, main_x_batch, 0, prompt_count,
                                       error, sizeof(error))) {
         fprintf(stderr, "%s\n", error); return 1;
@@ -6136,7 +6269,7 @@ int COLI_V4_GENERATE_MAIN(int argc, char **argv) {
     const float *last = state + (size_t)(prompt_count - 1) * hd;
     int current; float current_logit;
     if (final_hidden(hidden, last, index, &config, error, sizeof(error)) ||
-        head_argmax(hidden, index, &config, &current, &current_logit)) return 1;
+        head_argmax(NULL, hidden, index, &config, &current, &current_logit)) return 1;
     int generated_count = 0, last_processed = prompt_count - 1;
     generated[generated_count++] = current;
     int done = spec_print(&tokenizer, current, current_logit,
@@ -6147,16 +6280,16 @@ int COLI_V4_GENERATE_MAIN(int argc, char **argv) {
     coli_v4_speculative_controller_init(
         &controller, env_u64("COLI_V4_DSPARK_MIN_PROPOSALS", 10),
         env_float("COLI_V4_DSPARK_DISABLE_THRESHOLD", 0.35f));
-    int block = coli_v4_dspark_runner_block_size(runner);
+    int block = coli_v4_dspark_runner_verify_block_size(runner);
     int drafts[64], verified[65]; float draft_logits[64];
     while (!done && generated_count < max_new) {
         if (!controller.enabled || last_processed == prompt_count - 1) {
             int position = last_processed + 1;
-            if (target_token(&state, &next, attention, index, &config, experts,
+            if (target_token(NULL, &state, &next, attention, index, &config, experts,
                              current, position, error, sizeof(error)) ||
                 final_hidden(hidden, state, index, &config, error, sizeof(error)) ||
-                head_argmax(hidden, index, &config, &current, &current_logit) ||
-                coli_v4_dspark_capture_main_x(main_x_batch, 1, &config)) {
+                head_argmax(NULL, hidden, index, &config, &current, &current_logit) ||
+                coli_v4_dspark_capture_main_x(NULL, main_x_batch, 1, &config)) {
                 fprintf(stderr, "%s\n", error); return 1;
             }
             last_processed = position; generated[generated_count++] = current;
@@ -6172,15 +6305,15 @@ int COLI_V4_GENERATE_MAIN(int argc, char **argv) {
         }
         ColiV4VerificationResult verification;
         if (coli_v4_target_verify_greedy_batch(
-                &verification, verified, 65, attention, index, &config, experts,
-                current, drafts, block, last_processed + 1,
+                &verification, verified, 65, NULL, attention, index, &config,
+                experts, current, drafts, block, last_processed + 1,
                 error, sizeof(error))) {
             fprintf(stderr, "%s\n", error); return 1;
         }
         coli_v4_speculative_record(&controller, block,
                                    verification.accepted_draft_tokens);
         int committed = verification.accepted_draft_tokens + 1;
-        if (coli_v4_dspark_capture_main_x(main_x_batch, committed, &config))
+        if (coli_v4_dspark_capture_main_x(NULL, main_x_batch, committed, &config))
             return 1;
         memmove(main_x_batch,
                 main_x_batch + (size_t)(committed - 1) * config.hidden_size,
@@ -6227,8 +6360,8 @@ int COLI_V4_GENERATE_MAIN(int argc, char **argv) {
 #undef COLI_V4_GENERATE_HELPERS_ONLY
 #undef COLI_V4_GENERATE_MAIN
 
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
 
 #ifdef COLI_V4_EXPERIMENTAL_PARALLEL_PREFIX_VERIFY
 #include <omp.h>
@@ -6268,7 +6401,7 @@ static void *parallel_prefix_worker(void *argument) {
         job->result = -1;
     } else {
         job->result = target_token(
-            job->state_ptr, job->next_ptr, job->attention, job->index,
+            NULL, job->state_ptr, job->next_ptr, job->attention, job->index,
             job->config, job->experts, job->token, job->position,
             job->error, sizeof(job->error));
         if (!job->result)
@@ -6277,11 +6410,11 @@ static void *parallel_prefix_worker(void *argument) {
                 job->error, sizeof(job->error));
         if (!job->result)
             job->result = head_argmax(
-                hidden, job->index, job->config,
+                NULL, hidden, job->index, job->config,
                 &job->target_token, &job->target_logit);
         if (!job->result)
             job->result = coli_v4_dspark_capture_main_x(
-                job->main_x, 1, job->config);
+                NULL, job->main_x, 1, job->config);
     }
     free(hidden);
     omp_set_num_threads(previous_threads);
@@ -6541,6 +6674,363 @@ static void v4_attention_free(ColiDeepSeekV4WindowAttentionState **attention,
     free(attention);
 }
 
+struct ColiV4Session {
+    ColiV4Engine *engine;
+    ColiDeepSeekV4Config config;
+    ColiDeepSeekV4WindowAttentionState **attention;
+    float *state;
+    float *next;
+    float *hidden;
+    float *main_x_batch;
+    int *prompt_ids;
+    int *generated;
+    int max_prompt_tokens;
+    int max_new_tokens_cap;
+    int prompt_count;
+    int generated_count;
+    ColiV4DSparkRunner *runner;
+    Tok tokenizer;
+    int tokenizer_ready;
+    char *text;
+    int text_length;
+};
+
+static void session_free_buffers(ColiV4Session *session) {
+    if (!session) return;
+    free(session->text); session->text = NULL; session->text_length = 0;
+    free(session->main_x_batch); session->main_x_batch = NULL;
+    free(session->hidden); session->hidden = NULL;
+    free(session->next); session->next = NULL;
+    free(session->state); session->state = NULL;
+    free(session->generated); session->generated = NULL;
+    free(session->prompt_ids); session->prompt_ids = NULL;
+}
+
+static void session_free_attention(ColiV4Session *session) {
+    if (!session || !session->attention) return;
+    v4_attention_free(session->attention, session->config.num_hidden_layers);
+    session->attention = NULL;
+}
+
+void coli_v4_session_destroy(ColiV4Session *session) {
+    if (!session) return;
+    if (session->runner) {
+        coli_v4_dspark_runner_close(session->runner);
+        session->runner = NULL;
+    }
+    session_free_attention(session);
+    session_free_buffers(session);
+    free(session);
+}
+
+int coli_v4_session_create(ColiV4Session **output, ColiV4Engine *engine,
+                           const ColiV4SessionCreateOptions *options,
+                           char *error, size_t error_size) {
+    if (!output || !engine) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid V4 session create arguments");
+        return -1;
+    }
+    *output = NULL;
+    ColiV4Session *session = calloc(1, sizeof(*session));
+    if (!session) {
+        if (error && error_size)
+            snprintf(error, error_size, "out of memory creating V4 session");
+        return -1;
+    }
+    session->engine = engine;
+    session->config = *coli_v4_engine_config(engine);
+    session->max_prompt_tokens =
+        options && options->max_prompt_tokens > 0 ? options->max_prompt_tokens
+                                                  : 512;
+    session->max_new_tokens_cap =
+        options && options->max_new_tokens_cap > 0 ? options->max_new_tokens_cap
+                                                   : 512;
+
+    const char *model_dir = coli_v4_engine_target_model_dir(engine);
+    char tokenizer_path[4096];
+    if (!model_dir) {
+        coli_v4_session_destroy(session);
+        if (error && error_size)
+            snprintf(error, error_size, "engine has no target model directory");
+        return -1;
+    }
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
+             model_dir);
+    tok_load(&session->tokenizer, tokenizer_path);
+    session->tokenizer_ready = 1;
+
+    session->attention = calloc((size_t)session->config.num_hidden_layers,
+                                sizeof(*session->attention));
+    if (!session->attention) {
+        coli_v4_session_destroy(session);
+        if (error && error_size)
+            snprintf(error, error_size, "out of memory allocating attention");
+        return -1;
+    }
+    for (int layer = 0; layer < session->config.num_hidden_layers; layer++) {
+        if (coli_v4_window_attention_create(&session->attention[layer],
+                                            &session->config)) {
+            coli_v4_session_destroy(session);
+            if (error && error_size)
+                snprintf(error, error_size, "cannot create attention layer %d",
+                         layer);
+            return -1;
+        }
+    }
+
+    size_t hd = (size_t)session->config.hc_mult * session->config.hidden_size;
+    size_t slots = (size_t)session->max_prompt_tokens;
+    session->state = malloc(slots * hd * sizeof(float));
+    session->next = malloc(slots * hd * sizeof(float));
+    session->hidden = malloc((size_t)session->config.hidden_size * sizeof(float));
+    session->main_x_batch =
+        malloc(slots * (size_t)session->config.hidden_size * sizeof(float));
+    session->prompt_ids =
+        malloc((size_t)(session->max_prompt_tokens + 16) * sizeof(int));
+    session->generated =
+        malloc((size_t)(session->max_new_tokens_cap + 64) * sizeof(int));
+    if (!session->state || !session->next || !session->hidden ||
+        !session->main_x_batch || !session->prompt_ids || !session->generated) {
+        coli_v4_session_destroy(session);
+        if (error && error_size)
+            snprintf(error, error_size, "out of memory allocating session buffers");
+        return -1;
+    }
+    *output = session;
+    return 0;
+}
+
+int coli_v4_session_generated_text(const ColiV4Session *session,
+                                   char *buffer, size_t buffer_size,
+                                   size_t *out_length) {
+    if (!session || !buffer || buffer_size == 0) return -1;
+    size_t copy = session->text_length;
+    if (copy >= buffer_size) copy = buffer_size - 1;
+    if (session->text && copy)
+        memcpy(buffer, session->text, copy);
+    buffer[copy] = 0;
+    if (out_length) *out_length = copy;
+    return 0;
+}
+
+static int session_emit_token(ColiV4Session *session,
+                              ColiV4SessionTokenFn on_token, void *user_data,
+                              int token, float logit, int position, int ordinal,
+                              int stop_at_sentence) {
+    if (on_token) {
+        if (on_token(user_data, token, logit, position, ordinal)) return 1;
+    } else {
+        char piece[1024];
+        int length = tok_decode(&session->tokenizer, &token, 1, piece,
+                                (int)sizeof(piece) - 1);
+        if (length > 0) fwrite(piece, 1, (size_t)length, stdout);
+        fflush(stdout);
+        if (stop_at_sentence && spec_sentence_end(piece, length)) return 1;
+    }
+    return token == 1;
+}
+
+int coli_v4_session_generate(ColiV4Session *session,
+                             const char *prompt, size_t prompt_length,
+                             const ColiV4SessionGenerateOptions *options,
+                             ColiV4SessionTokenFn on_token, void *user_data,
+                             ColiV4SessionGenerateStats *stats_out,
+                             char *error, size_t error_size) {
+    if (!session || !session->engine || !prompt || !options ||
+        options->max_new_tokens < 1) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid V4 session generate arguments");
+        return -1;
+    }
+    if (stats_out) memset(stats_out, 0, sizeof(*stats_out));
+    free(session->text);
+    session->text = NULL;
+    session->text_length = 0;
+    session->prompt_count = 0;
+    session->generated_count = 0;
+    if (session->runner) {
+        coli_v4_dspark_runner_close(session->runner);
+        session->runner = NULL;
+    }
+    for (int layer = 0; layer < session->config.num_hidden_layers; layer++)
+        coli_v4_window_attention_reset(session->attention[layer]);
+
+    int max_new = options->max_new_tokens;
+    if (max_new > session->max_new_tokens_cap)
+        max_new = session->max_new_tokens_cap;
+    int prompt_capacity = session->max_prompt_tokens + 16;
+    int prompt_count = tok_encode(&session->tokenizer, prompt, prompt_length,
+                                  session->prompt_ids, prompt_capacity);
+    if (prompt_count < 1 || prompt_count > session->max_prompt_tokens) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "V4 prompt must encode to between 1 and %d tokens",
+                     session->max_prompt_tokens);
+        return -1;
+    }
+    session->prompt_count = prompt_count;
+
+    ColiV4Engine *engine = session->engine;
+    const ColiDeepSeekV4Config *config = &session->config;
+    ColiSafetensorsIndex *index = coli_v4_engine_target_index(engine);
+    ColiExpertStore *experts = coli_v4_engine_expert_store(engine);
+    float *state = session->state;
+    float *next = session->next;
+    float *hidden = session->hidden;
+    float *main_x_batch = session->main_x_batch;
+    ColiDeepSeekV4WindowAttentionState **attention = session->attention;
+    int *generated = session->generated;
+    size_t hd = (size_t)config->hc_mult * config->hidden_size;
+
+    for (int item = 0; item < prompt_count; item++)
+        if (load_embedding(state + (size_t)item * hd, index, config,
+                           session->prompt_ids[item])) {
+            if (error && error_size)
+                snprintf(error, error_size, "cannot load embedding");
+            return -1;
+        }
+
+    double setup_done = spec_now();
+    if (target_batch(engine, &state, &next, attention, index, config, experts,
+                     session->prompt_ids, 0, prompt_count, error, error_size))
+        return -1;
+    session->state = state;
+    session->next = next;
+    if (coli_v4_dspark_capture_main_x(engine, main_x_batch, prompt_count, config)) {
+        if (error && error_size)
+            snprintf(error, error_size, "dspark capture main_x failed");
+        return -1;
+    }
+
+    ColiV4DSparkRunner *runner = NULL;
+    if (!options->no_dspark) {
+        const char *draft = coli_v4_engine_dspark_model_dir(engine);
+        const char *target = coli_v4_engine_target_model_dir(engine);
+        if (coli_v4_dspark_runner_open(&runner, session->engine, draft, target,
+                                       config, 256ULL << 20, error, error_size) ||
+            coli_v4_dspark_runner_use_shared_heads(
+                runner, coli_v4_dspark_capture_heads(engine)))
+            return -1;
+        session->runner = runner;
+        if (coli_v4_dspark_runner_prefill(runner, main_x_batch, 0, prompt_count,
+                                          error, error_size))
+            return -1;
+    }
+
+    const float *last = state + (size_t)(prompt_count - 1) * hd;
+    int current = 0;
+    float current_logit = 0.0f;
+    if (final_hidden(hidden, last, index, config, error, error_size) ||
+        head_argmax(engine, hidden, index, config, &current, &current_logit))
+        return -1;
+    int generated_count = 0;
+    int last_processed = prompt_count - 1;
+    generated[generated_count++] = current;
+    int done = session_emit_token(session, on_token, user_data, current,
+                                  current_logit, last_processed,
+                                  generated_count, options->stop_at_sentence);
+    double first_at = spec_now();
+
+    ColiV4SpeculativeController controller;
+    coli_v4_speculative_controller_init(&controller, 10, 0.35f);
+    if (options->no_dspark) controller.enabled = 0;
+    int block = runner ? coli_v4_dspark_runner_verify_block_size(runner) : 0;
+    int drafts[64], verified[65];
+    float draft_logits[64];
+
+    while (!done && generated_count < max_new) {
+        if (!controller.enabled || last_processed == prompt_count - 1) {
+            int position = last_processed + 1;
+            if (target_token(engine, &state, &next, attention, index, config, experts,
+                             current, position, error, error_size))
+                return -1;
+            session->state = state;
+            session->next = next;
+            if (final_hidden(hidden, state, index, config, error, error_size) ||
+                head_argmax(engine, hidden, index, config, &current, &current_logit))
+                return -1;
+            if (coli_v4_dspark_capture_main_x(engine, main_x_batch, 1, config)) {
+                if (error && error_size)
+                    snprintf(error, error_size, "dspark capture failed");
+                return -1;
+            }
+            last_processed = position;
+            generated[generated_count++] = current;
+            done = session_emit_token(session, on_token, user_data, current,
+                                      current_logit, last_processed,
+                                      generated_count,
+                                      options->stop_at_sentence);
+            continue;
+        }
+        ColiV4VerificationResult verification;
+        if (coli_v4_dspark_runner_draft(runner, main_x_batch, current,
+                                        last_processed, drafts, draft_logits,
+                                        error, error_size))
+            return -1;
+        if (coli_v4_target_verify_greedy_batch(
+                &verification, verified, 65, engine, attention, index, config,
+                experts, current, drafts, block, last_processed + 1, error,
+                error_size))
+            return -1;
+        coli_v4_speculative_record(&controller, block,
+                                   verification.accepted_draft_tokens);
+        int committed = verification.accepted_draft_tokens + 1;
+        if (coli_v4_dspark_capture_main_x(engine, main_x_batch, committed, config)) {
+            if (error && error_size)
+                snprintf(error, error_size, "dspark capture failed");
+            return -1;
+        }
+        memmove(main_x_batch,
+                main_x_batch + (size_t)(committed - 1) * config->hidden_size,
+                (size_t)config->hidden_size * sizeof(float));
+        int base_position = last_processed + 1;
+        last_processed += committed;
+        for (int i = 0; i < verification.output_count &&
+                        generated_count < max_new && !done; i++) {
+            current = verified[i];
+            current_logit = 0.0f;
+            generated[generated_count++] = current;
+            done = session_emit_token(session, on_token, user_data, current,
+                                      current_logit, base_position + i,
+                                      generated_count,
+                                      options->stop_at_sentence);
+        }
+    }
+    double ended = spec_now();
+    session->state = state;
+    session->next = next;
+    session->generated_count = generated_count;
+
+    size_t text_capacity = (size_t)generated_count * 256 + 1;
+    session->text = malloc(text_capacity);
+    if (session->text) {
+        int text_count = generated_count;
+        if (text_count && generated[text_count - 1] == 1) text_count--;
+        session->text_length = tok_decode(&session->tokenizer, generated,
+                                          text_count, session->text,
+                                          (int)text_capacity - 1);
+    }
+    if (!on_token) {
+        fputc('\n', stdout);
+        fflush(stdout);
+    }
+    if (stats_out) {
+        stats_out->prompt_tokens = prompt_count;
+        stats_out->generated_tokens = generated_count;
+        stats_out->eos_stopped = done && generated_count > 0 &&
+                                 generated[generated_count - 1] == 1;
+        stats_out->dspark_rounds = controller.rounds;
+        stats_out->dspark_proposed = controller.proposed;
+        stats_out->dspark_accepted = controller.accepted;
+        stats_out->dspark_acceptance =
+            coli_v4_speculative_acceptance(&controller);
+        stats_out->time_to_first_token_sec = first_at - setup_done;
+        stats_out->decode_sec = ended - first_at;
+    }
+    return 0;
+}
+
 static int v4_oracle_teacher_forcing(
         const int *full_ids, int full_count, const int *expected, int expect_count,
         ColiDeepSeekV4WindowAttentionState **attention,
@@ -6561,7 +7051,7 @@ static int v4_oracle_teacher_forcing(
             free(state); free(next); free(hidden);
             return -1;
         }
-    if (target_batch(&state, &next, attention, index, config, experts,
+    if (target_batch(NULL, &state, &next, attention, index, config, experts,
                      full_ids, 0, full_count, error, error_size)) {
         free(state); free(next); free(hidden);
         return -1;
@@ -6573,7 +7063,7 @@ static int v4_oracle_teacher_forcing(
         float logit = 0.0f;
         if (final_hidden(hidden, state + (size_t)pos * hd, index, config,
                          error, error_size) ||
-            head_argmax(hidden, index, config, &pred, &logit)) {
+            head_argmax(NULL, hidden, index, config, &pred, &logit)) {
             free(state); free(next); free(hidden);
             return -1;
         }
@@ -6607,7 +7097,7 @@ static int v4_oracle_greedy_from_prompt(
             free(state); free(next); free(hidden);
             return -1;
         }
-    if (target_batch(&state, &next, attention, index, config, experts,
+    if (target_batch(NULL, &state, &next, attention, index, config, experts,
                      prompt_ids, 0, prompt_count, error, error_size)) {
         free(state); free(next); free(hidden);
         return -1;
@@ -6616,7 +7106,7 @@ static int v4_oracle_greedy_from_prompt(
     float logit = 0.0f;
     if (final_hidden(hidden, state + (size_t)(prompt_count - 1) * hd,
                      index, config, error, error_size) ||
-        head_argmax(hidden, index, config, &current, &logit)) {
+        head_argmax(NULL, hidden, index, config, &current, &logit)) {
         free(state); free(next); free(hidden);
         return -1;
     }
@@ -6624,10 +7114,10 @@ static int v4_oracle_greedy_from_prompt(
     generated[count++] = current;
     int position = prompt_count;
     while (count < max_new && current != 1) {
-        if (target_token(&state, &next, attention, index, config, experts,
+        if (target_token(NULL, &state, &next, attention, index, config, experts,
                          current, position, error, error_size) ||
             final_hidden(hidden, state, index, config, error, error_size) ||
-            head_argmax(hidden, index, config, &current, &logit)) {
+            head_argmax(NULL, hidden, index, config, &current, &logit)) {
             free(state); free(next); free(hidden);
             return -1;
         }
@@ -6648,8 +7138,62 @@ static int spec_print(Tok *tokenizer, int token, float logit,
     fflush(stdout);
     return stop_sentence && spec_sentence_end(piece, length);
 }
+
+static void v4_generate_cleanup(
+    ColiV4Session *session,
+    char *prompt_storage,
+    ColiV4Engine *engine,
+    ColiV4DSparkRunner *runner,
+    ColiDeepSeekV4WindowAttentionState **attention,
+    int layers,
+    int *prompt_ids,
+    int *generated,
+    float *state,
+    float *next,
+    float *hidden,
+    float *main_x_batch,
+    char *text,
+    int *full_ids,
+    int *tf_pred,
+    float *tf_state,
+    float *tf_next,
+    float *tf_hidden)
+{
+    /* Session owns attention/runner/buffers on the normal path. Clear any
+     * aliases into the session before destroying it to avoid double-free. */
+    if (session) {
+        prompt_ids = NULL;
+        generated = NULL;
+        attention = NULL;
+        runner = NULL;
+        state = NULL;
+        next = NULL;
+        hidden = NULL;
+        main_x_batch = NULL;
+        text = NULL;
+        coli_v4_session_destroy(session);
+    }
+    free(tf_hidden);
+    free(tf_next);
+    free(tf_state);
+    free(tf_pred);
+    free(full_ids);
+    free(text);
+    free(main_x_batch);
+    free(hidden);
+    free(next);
+    free(state);
+    free(generated);
+    free(prompt_ids);
+    v4_attention_free(attention, layers);
+    if (runner) coli_v4_dspark_runner_close(runner);
+    coli_v4_engine_destroy(engine);
+    free(prompt_storage);
+}
+
 int main(int argc, char **argv) {
     double process_started = spec_now();
+    int result = 1;
     V4CliOptions cli;
     if (v4_cli_parse(argc, argv, &cli)) {
         v4_cli_usage(stderr, argc ? argv[0] : "deepseek-v4");
@@ -6657,43 +7201,57 @@ int main(int argc, char **argv) {
     }
     int max_new = cli.max_new_tokens;
     int stop_sentence = cli.stop_sentence;
-    ColiDeepSeekV4RuntimeOptions *runtime;
-    coli_v4_runtime_reset();
-    runtime = coli_v4_runtime_options();
-    runtime->target_model_dir = cli.model_dir;
-    runtime->dspark_model_dir = cli.draft_model_dir;
-    if (cli.memory_gib > 0.0)
-        runtime->memory_limit_bytes =
-            (uint64_t)(cli.memory_gib * 1073741824.0);
 
     char error[512] = {0}, tokenizer_path[4096];
     char *prompt_storage = NULL;
+    ColiV4Engine *engine = NULL;
+    ColiV4Session *session = NULL;
+    ColiDeepSeekV4Config config;
+    memset(&config, 0, sizeof(config));
+    ColiSafetensorsIndex *index = NULL;
+    ColiExpertStore *experts = NULL;
+    ColiV4DSparkRunner *runner = NULL;
+    ColiDeepSeekV4WindowAttentionState **attention = NULL;
+    int *prompt_ids = NULL;
+    int *generated = NULL;
+    float *state = NULL, *next = NULL, *hidden = NULL, *main_x_batch = NULL;
+    char *text = NULL;
+    int *full_ids = NULL, *tf_pred = NULL;
+    float *tf_state = NULL, *tf_next = NULL, *tf_hidden = NULL;
+    int layers = 0;
     if (cli.prompt_file) {
         prompt_storage = v4_read_prompt_file(cli.prompt_file, error, sizeof(error));
         if (!prompt_storage) {
             fprintf(stderr, "%s\n", error);
-            return 1;
+            goto cleanup;
         }
         cli.prompt = prompt_storage;
     }
-    ColiDeepSeekV4Config config; ColiSafetensorsIndex *index = NULL;
-    ColiExpertStore *experts = NULL; ColiV4DSparkRunner *runner = NULL;
-    if (coli_v4_config_load(&config, cli.model_dir, error, sizeof(error)) ||
-        coli_st_index_open(&index, cli.model_dir, error, sizeof(error)) ||
-        coli_deepseek_v4_expert_store_open(
-            &(ColiDeepSeekV4ExpertStoreOptions){cli.model_dir,
-                config.num_hidden_layers, config.n_routed_experts, 4ULL << 30},
-            &experts, error, sizeof(error))) {
-        free(prompt_storage);
-        fprintf(stderr, "%s\n", error); return 1;
+    {
+        ColiV4EngineOpenOptions open_opts = {
+            .target_model_dir = cli.model_dir,
+            .dspark_model_dir = cli.draft_model_dir,
+            .pin_slots_per_layer = -1,
+        };
+        if (cli.memory_gib > 0.0)
+            open_opts.memory_limit_bytes =
+                (uint64_t)(cli.memory_gib * 1073741824.0);
+        if (coli_v4_engine_open(&engine, &open_opts, error, sizeof(error))) {
+            fprintf(stderr, "%s\n", error);
+            goto cleanup;
+        }
     }
+    config = *coli_v4_engine_config(engine);
+    index = coli_v4_engine_target_index(engine);
+    experts = coli_v4_engine_expert_store(engine);
+    layers = config.num_hidden_layers;
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
              cli.model_dir);
     Tok tokenizer; tok_load(&tokenizer, tokenizer_path);
 
     if (cli.oracle_path) {
         FILE *oracle_file = fopen(cli.oracle_path, "rb");
-        if (!oracle_file) { perror(cli.oracle_path); return 1; }
+        if (!oracle_file) { perror(cli.oracle_path); goto cleanup; }
         fseek(oracle_file, 0, SEEK_END);
         long oracle_bytes = ftell(oracle_file);
         fseek(oracle_file, 0, SEEK_SET);
@@ -6703,7 +7261,7 @@ int main(int argc, char **argv) {
                 (size_t)oracle_bytes) {
             fclose(oracle_file);
             free(oracle_text);
-            return 1;
+            goto cleanup;
         }
         oracle_text[oracle_bytes] = 0;
         fclose(oracle_file);
@@ -6711,21 +7269,20 @@ int main(int argc, char **argv) {
         jval *root = json_parse(oracle_text, &arena);
         free(oracle_text);
         int prompt_count = 0, full_count = 0, tf_count = 0;
-        int *prompt_ids = v4_oracle_read_ids(root, "prompt_ids", &prompt_count);
-        int *full_ids = v4_oracle_read_ids(root, "full_ids", &full_count);
-        int *tf_pred = v4_oracle_read_ids(root, "tf_pred", &tf_count);
+        prompt_ids = v4_oracle_read_ids(root, "prompt_ids", &prompt_count);
+        full_ids = v4_oracle_read_ids(root, "full_ids", &full_count);
+        tf_pred = v4_oracle_read_ids(root, "tf_pred", &tf_count);
         if (!prompt_ids || !full_ids || !tf_pred ||
             prompt_count < 1 || full_count <= prompt_count ||
             tf_count < 1) {
             fprintf(stderr, "invalid oracle fixture: %s\n", cli.oracle_path);
-            return 1;
+            goto cleanup;
         }
-        ColiDeepSeekV4WindowAttentionState **attention = calloc(
-            (size_t)config.num_hidden_layers, sizeof(*attention));
-        if (!attention) return 1;
+        attention = calloc((size_t)config.num_hidden_layers, sizeof(*attention));
+        if (!attention) goto cleanup;
         for (int layer = 0; layer < config.num_hidden_layers; layer++)
             if (coli_v4_window_attention_create(&attention[layer], &config))
-                return 1;
+                goto cleanup;
 
         int tf_limit = cli.teacher_forcing;
         if (tf_limit > tf_count) tf_limit = tf_count;
@@ -6735,7 +7292,7 @@ int main(int argc, char **argv) {
                                       attention, index, &config, experts,
                                       error, sizeof(error), &tf_matched)) {
             fprintf(stderr, "%s\n", error);
-            return 1;
+            goto cleanup;
         }
         printf("PREFILL (teacher-forcing) C vs oracle: %d/%d positions\n",
                tf_matched, tf_limit);
@@ -6743,13 +7300,13 @@ int main(int argc, char **argv) {
         for (int layer = 0; layer < config.num_hidden_layers; layer++)
             coli_v4_window_attention_reset(attention[layer]);
         int greedy_limit = cli.greedy;
-        int *generated = malloc((size_t)(greedy_limit + 8) * sizeof(int));
+        generated = malloc((size_t)(greedy_limit + 8) * sizeof(int));
         int got = v4_oracle_greedy_from_prompt(
             prompt_ids, prompt_count, generated, greedy_limit, attention,
             index, &config, experts, error, sizeof(error));
         if (got < 0) {
             fprintf(stderr, "%s\n", error);
-            return 1;
+            goto cleanup;
         }
         int greedy_matched = 0;
         int continue_count = full_count - prompt_count;
@@ -6764,10 +7321,11 @@ int main(int argc, char **argv) {
                         i, expected, generated[i]);
         }
         printf("GREEDY C vs oracle: %d/%d tokens\n", greedy_matched, compare);
-        v4_attention_free(attention, config.num_hidden_layers);
-        free(generated); free(prompt_ids); free(full_ids); free(tf_pred);
+        free(full_ids); free(tf_pred);
+        full_ids = NULL; tf_pred = NULL;
         (void)process_started;
-        return (tf_matched == tf_limit && greedy_matched == compare) ? 0 : 1;
+        result = (tf_matched == tf_limit && greedy_matched == compare) ? 0 : 1;
+        goto cleanup;
     }
 
     char *prompt = NULL;
@@ -6775,8 +7333,9 @@ int main(int argc, char **argv) {
     if (coli_v4_prompt_build(&prompt, &prompt_length, cli.prompt,
                              cli.system_prompt, cli.prompt_mode) ||
         prompt_length > INT_MAX - 16) {
+        free(prompt);
         fprintf(stderr, "cannot build DeepSeek V4 prompt\n");
-        return 1;
+        goto cleanup;
     }
     fprintf(stderr, "v4_cli mode=%s memory=%s draft_model=%s no_dspark=%d\n",
             cli.prompt_mode == COLI_V4_PROMPT_RAW ? "raw" :
@@ -6784,340 +7343,73 @@ int main(int argc, char **argv) {
             cli.memory_gib > 0.0 ? "limited" : "auto",
             cli.draft_model_dir, cli.no_dspark);
 
-    int prompt_capacity = (int)prompt_length + 16;
-    int *prompt_ids = malloc((size_t)prompt_capacity * sizeof(int));
-    int *generated = malloc((size_t)(max_new + 64) * sizeof(int));
-    int prompt_count = tok_encode(&tokenizer, prompt, prompt_length,
-                                  prompt_ids, prompt_capacity);
+    ColiV4SessionCreateOptions session_opts = {
+        .max_prompt_tokens = 512,
+        .max_new_tokens_cap = max_new > 512 ? max_new : 512,
+    };
+    if (coli_v4_session_create(&session, engine, &session_opts, error,
+                               sizeof(error))) {
+        free(prompt);
+        fprintf(stderr, "%s\n", error);
+        goto cleanup;
+    }
+    ColiV4SessionGenerateOptions gen_opts = {
+        .max_new_tokens = max_new,
+        .stop_at_sentence = stop_sentence,
+        .no_dspark = cli.no_dspark,
+    };
+    ColiV4SessionGenerateStats gen_stats;
+    memset(&gen_stats, 0, sizeof(gen_stats));
+    if (coli_v4_session_generate(session, prompt, prompt_length, &gen_opts,
+                                 NULL, NULL, &gen_stats, error,
+                                 sizeof(error))) {
+        free(prompt);
+        fprintf(stderr, "%s\n", error);
+        goto cleanup;
+    }
     free(prompt);
-    if (!prompt_ids || !generated || prompt_count < 1 || prompt_count > 512) {
-        fprintf(stderr, "V4 prompt must encode to between 1 and 512 tokens\n");
-        return 1;
-    }
-    size_t hd = (size_t)config.hc_mult * config.hidden_size;
-    float *state = malloc((size_t)prompt_count * hd * sizeof(float));
-    float *next = malloc((size_t)prompt_count * hd * sizeof(float));
-    float *hidden = malloc((size_t)config.hidden_size * sizeof(float));
-    float *main_x_batch = malloc((size_t)prompt_count * config.hidden_size * sizeof(float));
-    ColiDeepSeekV4WindowAttentionState **attention = calloc(
-        config.num_hidden_layers, sizeof(*attention));
-    if (!state || !next || !hidden || !main_x_batch || !attention) return 1;
-    for (int layer = 0; layer < config.num_hidden_layers; layer++)
-        if (coli_v4_window_attention_create(&attention[layer], &config)) return 1;
-    for (int item = 0; item < prompt_count; item++)
-        if (load_embedding(state + (size_t)item * hd, index, &config,
-                           prompt_ids[item])) return 1;
+    prompt = NULL;
 
-    double setup_done = spec_now(), phase_started = setup_done;
-    ColiExpertStoreStats stats_before = {0}, stats_after_prefill = {0};
-    experts->ops->stats(experts, &stats_before);
-    if (target_batch(&state, &next, attention, index, &config, experts,
-                     prompt_ids, 0, prompt_count, error, sizeof(error))) {
-        fprintf(stderr, "%s\n", error); return 1;
-    }
-    double target_prefill_done = spec_now();
-    experts->ops->stats(experts, &stats_after_prefill);
-    if (coli_v4_dspark_capture_main_x(main_x_batch, prompt_count, &config))
-        return 1;
-    double capture_done = spec_now();
-    if (!cli.no_dspark) {
-        if (coli_v4_dspark_runner_open(&runner, cli.draft_model_dir, cli.model_dir,
-                                       &config,
-                                       256ULL << 20, error, sizeof(error)) ||
-            coli_v4_dspark_runner_use_shared_heads(
-                runner, coli_v4_dspark_capture_heads())) {
-            fprintf(stderr, "%s\n", error); return 1;
-        }
-    }
-    double dspark_open_done = spec_now();
-    if (!cli.no_dspark) {
-        if (coli_v4_dspark_runner_prefill(runner, main_x_batch, 0, prompt_count,
-                                          error, sizeof(error))) {
-            fprintf(stderr, "%s\n", error); return 1;
-        }
-    }
-    double dspark_prefill_done = spec_now();
-    const float *last = state + (size_t)(prompt_count - 1) * hd;
-    int current; float current_logit;
-    if (final_hidden(hidden, last, index, &config, error, sizeof(error)) ||
-        head_argmax(hidden, index, &config, &current, &current_logit)) return 1;
-    double head_done = spec_now();
-    int generated_count = 0, last_processed = prompt_count - 1;
-    generated[generated_count++] = current;
-    int done = spec_print(&tokenizer, current, current_logit,
-                          last_processed, generated_count, stop_sentence);
-    double first_at = spec_now();
-
-    ColiV4SpeculativeController controller;
-    coli_v4_speculative_controller_init(&controller, 10, 0.35f);
-    if (cli.no_dspark) controller.enabled = 0;
-    int block = runner ? coli_v4_dspark_runner_block_size(runner) : 0;
-    int drafts[64], verified[65]; float draft_logits[64];
-    double target_single_seconds = 0.0, decode_head_seconds = 0.0;
-    double draft_seconds = 0.0, verify_seconds = 0.0, commit_seconds = 0.0;
-    uint64_t target_single_calls = 0, draft_calls = 0, verify_calls = 0;
-#ifdef COLI_V4_EXPERIMENTAL_PARALLEL_PREFIX_VERIFY
-    double prefix_seconds = 0.0, parallel_phase_seconds = 0.0;
-    uint64_t prefix_calls = 0;
-    int configured_threads = omp_get_max_threads();
-    int prefix_threads = configured_threads / 2;
-    int draft_threads = configured_threads - prefix_threads;
-    if (prefix_threads < 1) prefix_threads = 1;
-    if (draft_threads < 1) draft_threads = 1;
-    int parallel_prefix_enabled = block == 4 && configured_threads >= 4;
-    fprintf(stderr,
-            "v4_parallel_prefix enabled=%d prefix_threads=%d "
-            "draft_threads=%d total=%d\n",
-            parallel_prefix_enabled, prefix_threads, draft_threads,
-            configured_threads);
-#endif
-    while (!done && generated_count < max_new) {
-        if (!controller.enabled || last_processed == prompt_count - 1) {
-            int position = last_processed + 1;
-            double t0 = spec_now();
-            if (target_token(&state, &next, attention, index, &config, experts,
-                             current, position, error, sizeof(error))) {
-                fprintf(stderr, "%s\n", error); return 1;
-            }
-            target_single_seconds += spec_now() - t0; target_single_calls++;
-            t0 = spec_now();
-            if (final_hidden(hidden, state, index, &config, error, sizeof(error)) ||
-                head_argmax(hidden, index, &config, &current, &current_logit))
-                return 1;
-            decode_head_seconds += spec_now() - t0; t0 = spec_now();
-            if (coli_v4_dspark_capture_main_x(main_x_batch, 1, &config)) return 1;
-            commit_seconds += spec_now() - t0;
-            last_processed = position; generated[generated_count++] = current;
-            done = spec_print(&tokenizer, current, current_logit,
-                              last_processed, generated_count, stop_sentence);
-            continue;
-        }
-        const float *main_x = main_x_batch;
-        ColiV4VerificationResult verification;
-        double t0;
-#ifdef COLI_V4_EXPERIMENTAL_PARALLEL_PREFIX_VERIFY
-        if (!parallel_prefix_enabled) {
-            t0 = spec_now();
-            if (coli_v4_dspark_runner_draft(
-                    runner, main_x, current, last_processed,
-                    drafts, draft_logits, error, sizeof(error))) {
-                fprintf(stderr, "%s\n", error); return 1;
-            }
-            draft_seconds += spec_now() - t0; draft_calls++;
-            t0 = spec_now();
-            if (coli_v4_target_verify_greedy_batch(
-                    &verification, verified, 65, attention, index, &config,
-                    experts, current, drafts, block, last_processed + 1,
-                    error, sizeof(error))) {
-                fprintf(stderr, "%s\n", error); return 1;
-            }
-            verify_seconds += spec_now() - t0; verify_calls++;
-        } else {
-        float *prefix_main_x = malloc(
-            (size_t)config.hidden_size * sizeof(*prefix_main_x));
-        if (!prefix_main_x) return 1;
-        ParallelPrefixJob prefix_job = {
-            .state_ptr = &state,
-            .next_ptr = &next,
-            .attention = attention,
-            .index = index,
-            .config = &config,
-            .experts = experts,
-            .token = current,
-            .position = last_processed + 1,
-            .threads = prefix_threads,
-            .target_token = -1,
-            .main_x = prefix_main_x,
-            .result = -1,
-        };
-        pthread_t prefix_thread;
-        double parallel_began = spec_now();
-        if (pthread_create(&prefix_thread, NULL,
-                           parallel_prefix_worker, &prefix_job)) {
-            free(prefix_main_x);
-            fprintf(stderr, "could not create parallel target prefix\n");
-            return 1;
-        }
-        int previous_threads = omp_get_max_threads();
-        omp_set_num_threads(draft_threads);
-        t0 = spec_now();
-        int draft_result = coli_v4_dspark_runner_draft(
-            runner, main_x, current, last_processed,
-            drafts, draft_logits, error, sizeof(error));
-        draft_seconds += spec_now() - t0; draft_calls++;
-        omp_set_num_threads(previous_threads);
-        int prefix_join = pthread_join(prefix_thread, NULL);
-        parallel_phase_seconds += spec_now() - parallel_began;
-        prefix_seconds += prefix_job.seconds; prefix_calls++;
-        if (draft_result) {
-            free(prefix_main_x);
-            fprintf(stderr, "%s\n", error); return 1;
-        }
-        if (prefix_join || prefix_job.result) {
-            fprintf(stderr, "%s\n", prefix_job.error[0]
-                    ? prefix_job.error : "parallel target prefix failed");
-            free(prefix_main_x); return 1;
-        }
-        t0 = spec_now();
-        if (drafts[0] != prefix_job.target_token) {
-            verified[0] = prefix_job.target_token;
-            verification.accepted_draft_tokens = 0;
-            verification.output_count = 1;
-            verification.mismatch_index = 0;
-            if (coli_v4_dspark_capture_stage_main_x(
-                    prefix_main_x, 1, config.hidden_size)) {
-                free(prefix_main_x); return 1;
-            }
-        } else if (coli_v4_target_verify_after_prefix_v69(
-                       &verification, verified, 65, attention, index,
-                       &config, experts, drafts, block, last_processed + 1,
-                       prefix_main_x, error, sizeof(error))) {
-            free(prefix_main_x);
-            fprintf(stderr, "%s\n", error); return 1;
-        }
-        free(prefix_main_x);
-        verify_seconds += spec_now() - t0; verify_calls++;
-        }
-#else
-        t0 = spec_now();
-        if (coli_v4_dspark_runner_draft(
-                runner, main_x, current, last_processed,
-                drafts, draft_logits, error, sizeof(error))) {
-            fprintf(stderr, "%s\n", error); return 1;
-        }
-        draft_seconds += spec_now() - t0; draft_calls++;
-        t0 = spec_now();
-        if (coli_v4_target_verify_greedy_batch(
-                &verification, verified, 65, attention, index, &config, experts,
-                current, drafts, block, last_processed + 1,
-                error, sizeof(error))) {
-            fprintf(stderr, "%s\n", error); return 1;
-        }
-        verify_seconds += spec_now() - t0; verify_calls++;
-#endif
-        coli_v4_speculative_record(&controller, block,
-                                   verification.accepted_draft_tokens);
-        int committed = verification.accepted_draft_tokens + 1;
-        t0 = spec_now();
-        if (coli_v4_dspark_capture_main_x(main_x_batch, committed, &config))
-            return 1;
-        memmove(main_x_batch,
-                main_x_batch + (size_t)(committed - 1) * config.hidden_size,
-                (size_t)config.hidden_size * sizeof(float));
-#ifdef COLI_V4_EXPERIMENTAL_STATE_HASH
-        fprintf(stderr,
-                "v4_state_hash round=%llu committed=%d main_x=%016llx\n",
-                (unsigned long long)controller.rounds, committed,
-                (unsigned long long)state_hash_v70(
-                    main_x_batch, (size_t)config.hidden_size));
-#endif
-        commit_seconds += spec_now() - t0;
-        int base_position = last_processed + 1;
-        last_processed += committed;
-        fprintf(stderr,
-                "dspark_verify proposed=%d accepted=%d rate=%.3f enabled=%d\n",
-                block, verification.accepted_draft_tokens,
-                coli_v4_speculative_acceptance(&controller), controller.enabled);
-        for (int i = 0; i < verification.output_count &&
-                        generated_count < max_new && !done; i++) {
-            current = verified[i]; current_logit = 0.0f;
-            generated[generated_count++] = current;
-            done = spec_print(&tokenizer, current, current_logit,
-                              base_position + i, generated_count, stop_sentence);
-        }
-    }
-    double ended = spec_now();
-    ColiExpertStoreStats stats_end = {0}; experts->ops->stats(experts, &stats_end);
-    ColiExpertStoreStats prefill_stats = stats_subtract(
-        stats_after_prefill, stats_before);
-    ColiExpertStoreStats decode_stats = stats_subtract(
-        stats_end, stats_after_prefill);
-    size_t text_capacity = (size_t)generated_count * 256 + 1;
-    char *text = malloc(text_capacity);
-    int text_count = generated_count;
-    if (text_count && generated[text_count - 1] == 1) text_count--;
-    int text_length = tok_decode(&tokenizer, generated, text_count,
-                                 text, text_capacity - 1);
-    int decode_tokens = generated_count - 1;
-    double decode_seconds = ended - first_at;
-#ifdef COLI_V4_EXPERIMENTAL_PARALLEL_PREFIX_VERIFY
-    double scheduled_draft_seconds = parallel_prefix_enabled
-        ? parallel_phase_seconds : draft_seconds;
-    double timed_decode = target_single_seconds + decode_head_seconds +
-        scheduled_draft_seconds + verify_seconds + commit_seconds;
-#else
-    double timed_decode = target_single_seconds + decode_head_seconds +
-        draft_seconds + verify_seconds + commit_seconds;
-#endif
-    fputc('\n', stdout); fflush(stdout);
-    fprintf(stderr, "summary tokens=%d prompt_tokens=%d expert_requests=%llu "
-           "expert_hits=%llu expert_reads=%llu hit_rate=%.3f bytes=%llu "
-           "dspark_rounds=%llu proposed=%llu accepted=%llu rate=%.3f enabled=%d\n",
-           generated_count, prompt_count,
+    char out_text[65536];
+    size_t out_len = 0;
+    coli_v4_session_generated_text(session, out_text, sizeof(out_text),
+                                   &out_len);
+    ColiExpertStoreStats stats_end = {0};
+    experts->ops->stats(experts, &stats_end);
+    fprintf(stderr, "v4_tokens prompt=%d generated=%d total=%d "
+           "expert_requests=%llu hits=%llu misses=%llu hit_rate=%.3f "
+           "bytes=%llu speculative_rounds=%llu proposed=%llu accepted=%llu "
+           "acceptance=%.3f enabled=%d\n",
+           gen_stats.prompt_tokens, gen_stats.generated_tokens,
+           gen_stats.prompt_tokens + gen_stats.generated_tokens,
            (unsigned long long)stats_end.requests,
            (unsigned long long)stats_end.hits,
            (unsigned long long)stats_end.misses, stats_hit_rate(stats_end),
            (unsigned long long)stats_end.bytes_read,
-           (unsigned long long)controller.rounds,
-           (unsigned long long)controller.proposed,
-           (unsigned long long)controller.accepted,
-           coli_v4_speculative_acceptance(&controller), controller.enabled);
-    fprintf(stderr, "generated_text="); fwrite(text, 1, text_length, stderr);
-    fprintf(stderr, "\nprefill_timing startup=%.6fs target=%.6fs capture=%.6fs "
-           "dspark_open=%.6fs dspark=%.6fs first_head=%.6fs "
-           "pipeline=%.6fs wall_to_first=%.6fs target_tok_s=%.6f "
-           "combined_tok_s=%.6f\n",
-           setup_done - process_started,
-           target_prefill_done - phase_started,
-           capture_done - target_prefill_done,
-           dspark_open_done - capture_done,
-           dspark_prefill_done - dspark_open_done,
-           head_done - dspark_prefill_done,
-           first_at - setup_done, first_at - process_started,
-           prompt_count / (target_prefill_done - phase_started),
-           prompt_count / ((target_prefill_done - phase_started) +
-                           (dspark_prefill_done - dspark_open_done)));
-    fprintf(stderr, "prefill_experts requests=%llu hits=%llu misses=%llu "
-           "hit_rate=%.3f bytes=%llu prefetched=%llu prefetch_hits=%llu\n",
-           (unsigned long long)prefill_stats.requests,
-           (unsigned long long)prefill_stats.hits,
-           (unsigned long long)prefill_stats.misses,
-           stats_hit_rate(prefill_stats),
-           (unsigned long long)prefill_stats.bytes_read,
-           (unsigned long long)prefill_stats.prefetched,
-           (unsigned long long)prefill_stats.prefetch_hits);
-    fprintf(stderr, "decode_timing tokens=%d seconds=%.6f tok_s=%.6f sec_per_tok=%.6f "
-           "target_single=%.6f single_calls=%llu draft=%.6f draft_calls=%llu "
-           "verify=%.6f verify_calls=%llu head=%.6f commit=%.6f other=%.6f\n",
-           decode_tokens, decode_seconds,
-           decode_tokens / decode_seconds, decode_seconds / decode_tokens,
-           target_single_seconds, (unsigned long long)target_single_calls,
-           draft_seconds, (unsigned long long)draft_calls,
-           verify_seconds, (unsigned long long)verify_calls,
-           decode_head_seconds, commit_seconds, decode_seconds - timed_decode);
-#ifdef COLI_V4_EXPERIMENTAL_PARALLEL_PREFIX_VERIFY
-    fprintf(stderr, "parallel_prefix enabled=%d prefix=%.6f prefix_calls=%llu "
-           "parallel_phase=%.6f prefix_threads=%d draft_threads=%d\n",
-           parallel_prefix_enabled, prefix_seconds,
-           (unsigned long long)prefix_calls, parallel_phase_seconds,
-           prefix_threads, draft_threads);
-#endif
-    fprintf(stderr, "decode_experts requests=%llu hits=%llu misses=%llu "
-           "hit_rate=%.3f bytes=%llu prefetched=%llu prefetch_hits=%llu\n",
-           (unsigned long long)decode_stats.requests,
-           (unsigned long long)decode_stats.hits,
-           (unsigned long long)decode_stats.misses,
-           stats_hit_rate(decode_stats),
-           (unsigned long long)decode_stats.bytes_read,
-           (unsigned long long)decode_stats.prefetched,
-           (unsigned long long)decode_stats.prefetch_hits);
-    fprintf(stderr, "timing time_to_first_token=%.3fs after_first=%.3fs total=%.3fs\n",
-           first_at - setup_done, decode_seconds, ended - setup_done);
+           (unsigned long long)gen_stats.dspark_rounds,
+           (unsigned long long)gen_stats.dspark_proposed,
+           (unsigned long long)gen_stats.dspark_accepted,
+           gen_stats.dspark_acceptance,
+           !cli.no_dspark);
+    fprintf(stderr, "generated_text=");
+    if (out_len) fwrite(out_text, 1, out_len, stderr);
+    fprintf(stderr, "\ntiming time_to_first_token=%.3fs after_first=%.3fs\n",
+           gen_stats.time_to_first_token_sec, gen_stats.decode_sec);
+
+    /* Alias session buffers for optional record-oracle path.
+     * cleanup must destroy the session and must not free these aliases. */
+    prompt_ids = session->prompt_ids;
+    generated = session->generated;
+    attention = session->attention;
+    layers = session->config.num_hidden_layers;
+    int prompt_count = session->prompt_count;
+    int generated_count = session->generated_count;
+
     if (cli.record_oracle_path) {
         int full_count = prompt_count + generated_count;
-        int *full_ids = malloc((size_t)full_count * sizeof(int));
-        int *tf_pred = malloc((size_t)full_count * sizeof(int));
-        if (!full_ids || !tf_pred) return 1;
+        full_ids = malloc((size_t)full_count * sizeof(int));
+        tf_pred = malloc((size_t)full_count * sizeof(int));
+        if (!full_ids || !tf_pred) goto cleanup;
         memcpy(full_ids, prompt_ids, (size_t)prompt_count * sizeof(int));
         memcpy(full_ids + prompt_count, generated,
                (size_t)generated_count * sizeof(int));
@@ -7125,25 +7417,27 @@ int main(int argc, char **argv) {
             coli_v4_window_attention_reset(attention[layer]);
         /* Rebuild tf_pred for the fixture (argmax at each position). */
         size_t hd_tf = (size_t)config.hc_mult * config.hidden_size;
-        float *tf_state = malloc((size_t)full_count * hd_tf * sizeof(float));
-        float *tf_next = malloc((size_t)full_count * hd_tf * sizeof(float));
-        float *tf_hidden = malloc((size_t)config.hidden_size * sizeof(float));
-        if (!tf_state || !tf_next || !tf_hidden) return 1;
+        tf_state = malloc((size_t)full_count * hd_tf * sizeof(float));
+        tf_next = malloc((size_t)full_count * hd_tf * sizeof(float));
+        tf_hidden = malloc((size_t)config.hidden_size * sizeof(float));
+        if (!tf_state || !tf_next || !tf_hidden) goto cleanup;
         for (int item = 0; item < full_count; item++)
             if (load_embedding(tf_state + (size_t)item * hd_tf, index, &config,
-                               full_ids[item])) return 1;
-        if (target_batch(&tf_state, &tf_next, attention, index, &config, experts,
-                         full_ids, 0, full_count, error, sizeof(error))) {
-            fprintf(stderr, "%s\n", error); return 1;
+                               full_ids[item])) goto cleanup;
+        if (target_batch(engine, &tf_state, &tf_next, attention, index, &config,
+                         experts, full_ids, 0, full_count, error, sizeof(error))) {
+            fprintf(stderr, "%s\n", error); goto cleanup;
         }
         for (int pos = 0; pos < full_count; pos++) {
             float logit = 0.0f;
             if (final_hidden(tf_hidden, tf_state + (size_t)pos * hd_tf,
                              index, &config, error, sizeof(error)) ||
-                head_argmax(tf_hidden, index, &config, &tf_pred[pos], &logit))
-                return 1;
+                head_argmax(engine, tf_hidden, index, &config, &tf_pred[pos],
+                            &logit))
+                goto cleanup;
         }
         free(tf_state); free(tf_next); free(tf_hidden);
+        tf_state = NULL; tf_next = NULL; tf_hidden = NULL;
         /* Chat-template prompt tokens need not be model-greedy; only score
          * the continuation window that record actually generated. */
         int tf_matched = 0, tf_total = generated_count;
@@ -7159,21 +7453,29 @@ int main(int argc, char **argv) {
                                  full_ids, full_count,
                                  tf_pred, full_count)) {
             fprintf(stderr, "cannot write oracle %s\n", cli.record_oracle_path);
-            return 1;
+            goto cleanup;
         }
         fprintf(stderr,
                 "wrote oracle %s (source=coli-self, "
                 "continuation_self_check=%d/%d)\n",
                 cli.record_oracle_path, tf_matched, tf_total);
         free(full_ids); free(tf_pred);
+        full_ids = NULL; tf_pred = NULL;
     }
-    return 0;
+    result = 0;
+cleanup:
+    v4_generate_cleanup(session, prompt_storage, engine, runner, attention,
+                        layers, prompt_ids, generated, state, next, hidden,
+                        main_x_batch, text, full_ids, tf_pred, tf_state,
+                        tf_next, tf_hidden);
+    return result;
 }
+
 #endif /* COLI_V4_UNIT_GENERATE_STATS */
 
 #ifdef COLI_V4_UNIT_KV_CACHE
 /* ######## deepseek_v4_kv_cache.c ######## */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -7276,12 +7578,12 @@ int coli_v4_kv_cache_value_count(const ColiDeepSeekV4KVCache *cache) {
 
 #ifdef COLI_V4_UNIT_ATTENTION_CACHE
 /* ######## deepseek_v4_attention_cache.c ######## */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <stdlib.h>
 
-#include "deepseek_v4.h"
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
+#include "deepseek_v4_internal.h"
 
 struct ColiDeepSeekV4AttentionCache {
     ColiDeepSeekV4KVCache *kv;
@@ -7353,11 +7655,11 @@ int coli_v4_attention_cache_step(ColiDeepSeekV4AttentionCache *cache,
 
 #ifdef COLI_V4_UNIT_EXPERT
 /* ######## deepseek_v4_expert.c ######## */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <stdlib.h>
 
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 #include "native_quant.h"
 
 int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
@@ -7446,8 +7748,9 @@ int coli_v4_shared_expert_forward_ref(float *output,
 #ifdef COLI_V4_UNIT_EXPERT_STORE
 /* ######## deepseek_v4_expert_store.c ######## */
 #define _GNU_SOURCE
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
+#include <assert.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -7491,6 +7794,7 @@ typedef struct {
     V4ExpertRecord *records;
     V4ExpertSlot *slots;
     uint64_t clock;
+    unsigned active_leases;
     ColiExpertStoreStats stats;
     pthread_mutex_t mutex;
 } V4ExpertStoreState;
@@ -7598,10 +7902,16 @@ static void fill_tensor_view(ColiTensorView *view,
 
 static int lookup(ColiExpertStore *store, ColiExpertKey key,
                   ColiExpertView *view) {
-    if (!store || !store->state || !view) return -1;
+    if (!store || !store->state || !view) {
+        if (view) memset(view, 0, sizeof(*view));
+        return -1;
+    }
     V4ExpertStoreState *state = store->state;
     V4ExpertRecord *record = get_record(state, key);
-    if (!record) return -1;
+    if (!record) {
+        memset(view, 0, sizeof(*view));
+        return -1;
+    }
     pthread_mutex_lock(&state->mutex);
     state->stats.requests++;
     V4ExpertSlot *slots = layer_slots(state, key.layer);
@@ -7621,12 +7931,14 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         }
         if (!slot) {
             pthread_mutex_unlock(&state->mutex);
+            memset(view, 0, sizeof(*view));
             return -1;
         }
         if (!slot->slab) {
             slot->slab = malloc((size_t)state->record_bytes);
             if (!slot->slab) {
                 pthread_mutex_unlock(&state->mutex);
+                memset(view, 0, sizeof(*view));
                 return -1;
             }
             state->stats.resident_bytes += state->record_bytes;
@@ -7639,6 +7951,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
                             (size_t)record->weight_bytes,
                             slot->slab + record->scale_bytes) != 0) {
             pthread_mutex_unlock(&state->mutex);
+            memset(view, 0, sizeof(*view));
             return -1;
         }
         slot->expert = key.expert;
@@ -7646,6 +7959,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         state->stats.bytes_read += record->record_bytes;
     }
     slot->references++;
+    state->active_leases++;
     slot->used = ++state->clock;
     memset(view, 0, sizeof(*view));
     view->key = key;
@@ -7658,13 +7972,17 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
 }
 
 static void release(ColiExpertStore *store, ColiExpertView *view) {
-    if (!store || !store->state || !view || !view->lease) return;
+    if (!store || !store->state || !view || !view->lease) {
+        if (view) memset(view, 0, sizeof(*view));
+        return;
+    }
     V4ExpertStoreState *state = store->state;
     V4ExpertSlot *slot = view->lease;
     pthread_mutex_lock(&state->mutex);
     if (slot->references) slot->references--;
-    view->lease = NULL;
+    if (state->active_leases) state->active_leases--;
     pthread_mutex_unlock(&state->mutex);
+    memset(view, 0, sizeof(*view));
 }
 
 static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
@@ -7734,6 +8052,7 @@ static void destroy(ColiExpertStore *store) {
     if (!store) return;
     V4ExpertStoreState *state = store->state;
     if (state) {
+        assert(state->active_leases == 0 && "destroy with active expert leases");
         for (int i = 0; i < state->layers * state->slots_per_layer; i++)
             free(state->slots[i].slab);
         pthread_mutex_destroy(&state->mutex);
@@ -7829,7 +8148,7 @@ fail:
 
 #ifdef COLI_V4_UNIT_LAYER
 /* ######## deepseek_v4_layer.c ######## */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -8003,16 +8322,20 @@ int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
     return 0;
 }
 
-void coli_v4_layer_free(ColiDeepSeekV4LayerWeights *weights) {
+void coli_v4_layer_free(ColiV4Engine *engine,
+                        ColiDeepSeekV4LayerWeights *weights) {
+    (void)engine;
     if (!weights) return;
     for (size_t i = 0; i < weights->plan.tensor_count; i++) free(weights->data[i]);
     memset(weights, 0, sizeof(*weights));
 }
 
-int coli_v4_layer_load(ColiDeepSeekV4LayerWeights *weights,
+int coli_v4_layer_load(ColiV4Engine *engine,
+                       ColiDeepSeekV4LayerWeights *weights,
                        const ColiDeepSeekV4Config *config,
                        const ColiSafetensorsIndex *index, int layer,
                        char *error, size_t error_size) {
+    (void)engine;
     if (!weights) return set_error(error, error_size, "missing layer weights output");
     memset(weights, 0, sizeof(*weights));
     if (coli_v4_layer_plan(&weights->plan, config, layer, error, error_size) != 0 ||
@@ -8024,11 +8347,11 @@ int coli_v4_layer_load(ColiDeepSeekV4LayerWeights *weights,
         const ColiSafetensorsTensor *tensor = coli_st_find(index, spec->name);
         weights->data[i] = malloc((size_t)tensor->nbytes);
         if (!weights->data[i]) {
-            coli_v4_layer_free(weights);
+            coli_v4_layer_free(NULL, weights);
             return set_error(error, error_size, "out of memory loading: %s", spec->name);
         }
         if (coli_st_read_tensor(index, tensor, weights->data[i]) != 0) {
-            coli_v4_layer_free(weights);
+            coli_v4_layer_free(NULL, weights);
             return set_error(error, error_size, "cannot read tensor: %s", spec->name);
         }
     }
@@ -8052,7 +8375,7 @@ const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
 
 #ifdef COLI_V4_UNIT_CONFIG
 /* ######## deepseek_v4_config.c ######## */
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include <stdarg.h>
 #include <stdio.h>

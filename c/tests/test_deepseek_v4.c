@@ -1,5 +1,5 @@
 /* Merged DeepSeek V4 unit tests (GLM-style single harness). */
-#include "../deepseek_v4.h"
+#include "../deepseek_v4_internal.h"
 #include "../deepseek_v4_dspark.h"
 #include "../compat.h"
 #include "../native_quant.h"
@@ -190,7 +190,7 @@ static int test_expert_store(void) {
     if (write_fixture(path) != 0) { perror("write_fixture"); return 1; }
 
     ColiDeepSeekV4ExpertStoreOptions options = {
-        directory, 1, 1, 51
+        directory, 1, 1, 51, -1, 0
     };
     ColiExpertStore *store = NULL;
     if (coli_deepseek_v4_expert_store_open(&options, &store,
@@ -222,8 +222,27 @@ static int test_expert_store(void) {
                   ((const unsigned char *)view.down.data)[0],
                   ((const unsigned char *)view.up.data)[0]); return 1; }
     coli_expert_release(store, &view);
+    {
+        static const ColiExpertView zero;
+        if (memcmp(&view, &zero, sizeof(view)) != 0) {
+            fprintf(stderr, "release did not clear view\n");
+            return 1;
+        }
+    }
+    /* Double release of a cleared view is a no-op. */
+    coli_expert_release(store, &view);
     if (coli_expert_lookup(store, key, &view) != 0) return 1;
     coli_expert_release(store, &view);
+    /* Invalid key lookup must fail and clear the view. */
+    memset(&view, 0x3c, sizeof(view));
+    if (coli_expert_lookup(store, (ColiExpertKey){9, 9}, &view) == 0) return 1;
+    {
+        static const ColiExpertView zero;
+        if (memcmp(&view, &zero, sizeof(view)) != 0) {
+            fprintf(stderr, "failed lookup did not clear view\n");
+            return 1;
+        }
+    }
     ColiExpertStoreStats stats;
     store->ops->stats(store, &stats);
     if (stats.requests != 2 || stats.hits != 1 || stats.misses != 1 ||

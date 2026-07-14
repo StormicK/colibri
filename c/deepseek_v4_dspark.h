@@ -1,7 +1,7 @@
 #ifndef COLIBRI_DEEPSEEK_V4_DSPARK_H
 #define COLIBRI_DEEPSEEK_V4_DSPARK_H
 
-#include "deepseek_v4.h"
+#include "deepseek_v4_internal.h"
 
 #include "tensor.h"
 #include "expert_store.h"
@@ -20,19 +20,7 @@
 /* via deepseek_v4.h: deepseek_v4_config.h */
 /* via deepseek_v4.h: deepseek_v4_layer.h */
 
-#define COLI_V4_DSPARK_MAX_STAGES 8
-#define COLI_V4_DSPARK_MAX_TARGETS 8
-
-typedef struct {
-    int stage_count;
-    int block_size;
-    int noise_token_id;
-    int markov_rank;
-    int target_count;
-    int target_layer_ids[COLI_V4_DSPARK_MAX_TARGETS];
-    uint64_t common_stage_bytes[COLI_V4_DSPARK_MAX_STAGES];
-    uint64_t special_bytes;
-} ColiDeepSeekV4DSparkManifest;
+/* COLI_V4_DSPARK_MAX_* and ColiDeepSeekV4DSparkManifest: deepseek_v4_internal.h */
 
 int coli_v4_dspark_inspect(const char *model_dir,
                            const ColiDeepSeekV4Config *config,
@@ -72,10 +60,13 @@ int coli_v4_dspark_memory_plan(const char *model_dir,
 /* amalgamated: deepseek_v4_dspark.h */
 /* via deepseek_v4.h: deepseek_v4_expert_store.h */
 
-int coli_v4_dspark_layer_load(ColiDeepSeekV4LayerWeights *weights,
+int coli_v4_dspark_layer_load(ColiV4Engine *engine,
+                              ColiDeepSeekV4LayerWeights *weights,
                               const ColiDeepSeekV4Config *config,
                               const ColiSafetensorsIndex *index, int stage,
                               char *error, size_t error_size);
+void coli_v4_dspark_layer_release(ColiV4Engine *engine,
+                                  ColiDeepSeekV4LayerWeights *weights);
 int coli_deepseek_v4_dspark_expert_store_open(
     const ColiDeepSeekV4ExpertStoreOptions *options,
     ColiExpertStore **store, char *error, size_t error_size);
@@ -84,8 +75,8 @@ int coli_deepseek_v4_dspark_expert_store_open(
 /* ==== begin deepseek_v4_dspark_runtime_resident.h ==== */
 
 /* via deepseek_v4.h: deepseek_v4_layer.h */
+/* coli_v4_dspark_layer_release declared above with engine parameter */
 
-void coli_v4_dspark_layer_release(ColiDeepSeekV4LayerWeights *weights);
 /* ==== end deepseek_v4_dspark_runtime_resident.h ==== */
 
 /* ==== begin deepseek_v4_dspark_attention.h ==== */
@@ -175,13 +166,13 @@ int coli_v4_dspark_combine_hidden(ColiV4DSparkHeads *heads, float *output,
 int coli_v4_dspark_markov_bias(ColiV4DSparkHeads *heads, float *bias,
                                int previous_token);
 int coli_v4_dspark_biased_argmax(
-    ColiV4DSparkHeads *heads, const ColiSafetensorsIndex *target_index,
-    const float *hidden, int previous_token,
-    int *best_token, float *best_logit);
+    ColiV4Engine *engine, ColiV4DSparkHeads *heads,
+    const ColiSafetensorsIndex *target_index, const float *hidden,
+    int previous_token, int *best_token, float *best_logit);
 int coli_v4_dspark_biased_argmax_batch(
-    ColiV4DSparkHeads *heads, const ColiSafetensorsIndex *target_index,
-    const float *hidden_batch, int previous_token,
-    int *best_tokens, float *best_logits, int batch);
+    ColiV4Engine *engine, ColiV4DSparkHeads *heads,
+    const ColiSafetensorsIndex *target_index, const float *hidden_batch,
+    int previous_token, int *best_tokens, float *best_logits, int batch);
 /* ==== end deepseek_v4_dspark_heads.h ==== */
 
 /* ==== begin deepseek_v4_dspark_runner.h ==== */
@@ -194,6 +185,7 @@ int coli_v4_dspark_biased_argmax_batch(
 typedef struct ColiV4DSparkRunner ColiV4DSparkRunner;
 
 int coli_v4_dspark_runner_open(ColiV4DSparkRunner **output,
+                               ColiV4Engine *engine,
                                const char *dspark_model_dir,
                                const char *target_model_dir,
                                const ColiDeepSeekV4Config *config,
@@ -210,6 +202,8 @@ int coli_v4_dspark_runner_draft(ColiV4DSparkRunner *runner,
                                 float *draft_logits,
                                 char *error, size_t error_size);
 int coli_v4_dspark_runner_block_size(const ColiV4DSparkRunner *runner);
+/* Verify-window draft count (min of manifest.block_size and runtime.verify_drafts). */
+int coli_v4_dspark_runner_verify_block_size(const ColiV4DSparkRunner *runner);
 uint64_t coli_v4_dspark_runner_loaded_stage_peak(
     const ColiV4DSparkRunner *runner);
 /* ==== end deepseek_v4_dspark_runner.h ==== */
@@ -228,11 +222,16 @@ int coli_v4_dspark_runner_use_shared_heads(ColiV4DSparkRunner *runner,
 /* via deepseek_v4.h: deepseek_v4_config.h */
 /* amalgamated: deepseek_v4_dspark_heads.h */
 
-int coli_v4_dspark_capture_main_x(float *outputs, int batch,
+int coli_v4_dspark_capture_main_x(ColiV4Engine *engine, float *outputs,
+                                  int batch,
                                   const ColiDeepSeekV4Config *config);
-ColiV4DSparkHeads *coli_v4_dspark_capture_heads(void);
-int coli_v4_dspark_capture_stage_main_x(const float *values, int batch,
+ColiV4DSparkHeads *coli_v4_dspark_capture_heads(ColiV4Engine *engine);
+int coli_v4_dspark_capture_stage_main_x(ColiV4Engine *engine,
+                                        const float *values, int batch,
                                         int hidden_size);
+void coli_v4_dspark_capture_after_block(
+    ColiV4Engine *engine, const ColiDeepSeekV4LayerWeights *weights,
+    const ColiDeepSeekV4Config *config, const float *outputs, int batch);
 /* ==== end deepseek_v4_dspark_capture.h ==== */
 
 /* ==== begin deepseek_v4_speculative.h ==== */
@@ -277,6 +276,7 @@ int coli_v4_verify_greedy(ColiV4VerificationResult *result,
 int coli_v4_target_verify_greedy_batch(
     ColiV4VerificationResult *verification,
     int *output_tokens, int output_capacity,
+    ColiV4Engine *engine,
     ColiDeepSeekV4WindowAttentionState **attention,
     const ColiSafetensorsIndex *index,
     const ColiDeepSeekV4Config *config, ColiExpertStore *experts,
@@ -294,6 +294,7 @@ int coli_v4_target_verify_greedy_batch(
 int coli_v4_target_verify_after_prefix_v69(
     ColiV4VerificationResult *verification,
     int *output_tokens, int output_capacity,
+    ColiV4Engine *engine,
     ColiDeepSeekV4WindowAttentionState **attention,
     const ColiSafetensorsIndex *index,
     const ColiDeepSeekV4Config *config, ColiExpertStore *experts,

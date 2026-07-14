@@ -155,7 +155,7 @@ PYTHON    ?= python3
 endif
 CUDA_OBJ  =
 
-# DeepSeek V4 amalgamation needs GNU ld --wrap and x86-64 -march; keep it off
+# DeepSeek V4 amalgamation needs x86-64 -march / AVX paths; keep it off
 # macOS / PowerPC / other hosts so `make check` still validates GLM + infra.
 COLI_V4_SUPPORTED :=
 ifeq ($(IS_WIN),1)
@@ -167,7 +167,7 @@ endif
 endif
 
 # Shared V4-era infra tests are portable; the amalgam unit binary is gated.
-V4_INFRA_TEST_BINS = tests/test_model_interfaces$(EXE) \
+V4_INFRA_TEST_BINS = tests/test_expert_store_ops$(EXE) \
 	tests/test_safetensors_index$(EXE) tests/test_native_quant$(EXE) \
 	tests/test_tensor_io$(EXE)
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) \
@@ -332,7 +332,7 @@ tests/test_compat_direct$(EXE): tests/test_compat_direct.c compat.h
 tests/test_uring$(EXE): tests/test_uring.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_model_interfaces$(EXE): tests/test_model_interfaces.c model.h expert_store.h tensor.h
+tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c expert_store.h tensor.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_safetensors_index$(EXE): tests/test_safetensors_index.c safetensors_index.c safetensors_index.h json.h

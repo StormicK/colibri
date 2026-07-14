@@ -34,13 +34,7 @@ CFLAGS = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
 	-DCOLI_V4_EXPERIMENTAL_PARALLEL_PREFIX_VERIFY \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
 	-DCOLI_V4_PIN_RAMP_REQUESTS=24
-LDFLAGS = -lm -fopenmp -static -pthread \
-	-Wl,--wrap=coli_deepseek_v4_expert_store_open \
-	-Wl,--wrap=coli_st_read_at \
-	-Wl,--wrap=coli_v4_block_window_batch_ref \
-	-Wl,--wrap=coli_v4_block_window_token_ref \
-	-Wl,--wrap=coli_v4_dspark_runner_block_size \
-	-Wl,--wrap=coli_v4_dspark_biased_argmax
+LDFLAGS = -lm -fopenmp -static -pthread
 V4_BINARY := deepseek_v4.exe
 else
 CC = gcc
@@ -51,13 +45,7 @@ CFLAGS = -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
 	-DCOLI_V4_EXPERIMENTAL_PARALLEL_PREFIX_VERIFY \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
 	-DCOLI_V4_PIN_RAMP_REQUESTS=24
-LDFLAGS = -lm -fopenmp -pthread \
-	-Wl,--wrap=coli_deepseek_v4_expert_store_open \
-	-Wl,--wrap=coli_st_read_at \
-	-Wl,--wrap=coli_v4_block_window_batch_ref \
-	-Wl,--wrap=coli_v4_block_window_token_ref \
-	-Wl,--wrap=coli_v4_dspark_runner_block_size \
-	-Wl,--wrap=coli_v4_dspark_biased_argmax
+LDFLAGS = -lm -fopenmp -pthread
 V4_BINARY := deepseek_v4
 endif
 
