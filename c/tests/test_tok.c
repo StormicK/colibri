@@ -7,7 +7,7 @@
 int main(int argc, char **argv){
     if(argc<2){ fprintf(stderr,"usage: %s tokenizer.json < cases\n",argv[0]); return 1; }
     Tok T;
-    tok_load(&T, argv[1]);
+    if(tok_load(&T, argv[1])!=0) return 1;
     fprintf(stderr,"loaded: vocab_ids=%d specials=%d\n", T.n_ids, T.nsp);
     char *line=NULL; size_t cap=0; ssize_t nr;
     int pass=0, tot=0, dpass=0;
@@ -42,5 +42,7 @@ int main(int argc, char **argv){
         }
     }
     printf("ENCODE: %d/%d  DECODE(round-trip): %d/%d\n", pass,tot, dpass,tot);
+    free(line);
+    tok_free(&T);
     return pass==tot ? 0 : 2;
 }

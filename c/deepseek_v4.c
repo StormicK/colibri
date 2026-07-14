@@ -6089,7 +6089,7 @@ int main(int argc, char **argv) {
     if (text_mode) {
         char tokenizer_path[4096];
         snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", argv[1]);
-        tok_load(&tokenizer, tokenizer_path);
+        if (tok_load(&tokenizer, tokenizer_path) != 0) return 1;
         int prompt_capacity = (int)strlen(argv[3]) + 16;
         prompt_ids = malloc((size_t)prompt_capacity * sizeof(*prompt_ids));
         generated_ids = malloc((size_t)token_count * sizeof(*generated_ids));
@@ -6190,6 +6190,7 @@ int main(int argc, char **argv) {
     free(attention);
     free(generated_ids); free(prompt_ids);
     free(hidden); free(next); free(state);
+    if (text_mode) tok_free(&tokenizer);
     experts->ops->destroy(experts);
     coli_st_index_close(index);
     return 0;
@@ -6332,7 +6333,8 @@ int COLI_V4_GENERATE_MAIN(int argc, char **argv) {
         fprintf(stderr, "%s\n", error); return 1;
     }
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", argv[1]);
-    Tok tokenizer; tok_load(&tokenizer, tokenizer_path);
+    Tok tokenizer;
+    if (tok_load(&tokenizer, tokenizer_path) != 0) return 1;
     int prompt_capacity = (int)strlen(argv[3]) + 16;
     int *prompt_ids = malloc((size_t)prompt_capacity * sizeof(int));
     int *generated = malloc((size_t)(max_new + 64) * sizeof(int));
@@ -6456,6 +6458,7 @@ int COLI_V4_GENERATE_MAIN(int argc, char **argv) {
     printf("generated_text="); fwrite(text, 1, text_length, stdout);
     printf("\ntiming time_to_first_token=%.3fs after_first=%.3fs total=%.3fs\n",
            first_at - started, ended - first_at, ended - started);
+    tok_free(&tokenizer);
     return 0;
 }
 #endif
@@ -6803,6 +6806,10 @@ void coli_v4_session_destroy(ColiV4Session *session) {
     coli_v4_session_clear_runner(session);
     session_free_attention(session);
     session_free_buffers(session);
+    if (session->tokenizer_ready) {
+        tok_free(&session->tokenizer);
+        session->tokenizer_ready = 0;
+    }
     if (session->engine) {
         coli_v4_engine_detach_session(session->engine);
         session->engine = NULL;
@@ -6845,7 +6852,13 @@ int coli_v4_session_create(ColiV4Session **output, ColiV4Engine *engine,
     }
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
              model_dir);
-    tok_load(&session->tokenizer, tokenizer_path);
+    if (tok_load(&session->tokenizer, tokenizer_path) != 0) {
+        coli_v4_session_destroy(session);
+        if (error && error_size)
+            snprintf(error, error_size, "cannot load tokenizer from %s",
+                     tokenizer_path);
+        return -1;
+    }
     session->tokenizer_ready = 1;
 
     session->attention = calloc((size_t)session->config.num_hidden_layers,
@@ -7293,6 +7306,8 @@ int main(int argc, char **argv) {
     char *prompt_storage = NULL;
     ColiV4Engine *engine = NULL;
     ColiV4Session *session = NULL;
+    Tok tokenizer;
+    memset(&tokenizer, 0, sizeof(tokenizer));
     ColiDeepSeekV4Config config;
     memset(&config, 0, sizeof(config));
     ColiSafetensorsIndex *index = NULL;
@@ -7334,7 +7349,10 @@ int main(int argc, char **argv) {
     layers = config.num_hidden_layers;
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
              cli.model_dir);
-    Tok tokenizer; tok_load(&tokenizer, tokenizer_path);
+    if (tok_load(&tokenizer, tokenizer_path) != 0) {
+        fprintf(stderr, "cannot load tokenizer from %s\n", tokenizer_path);
+        goto cleanup;
+    }
 
     if (cli.oracle_path) {
         FILE *oracle_file = fopen(cli.oracle_path, "rb");
@@ -7551,6 +7569,7 @@ int main(int argc, char **argv) {
     }
     result = 0;
 cleanup:
+    tok_free(&tokenizer);
     v4_generate_cleanup(session, prompt_storage, engine, runner, attention,
                         layers, prompt_ids, generated, state, next, hidden,
                         main_x_batch, text, full_ids, tf_pred, tf_state,
