@@ -617,6 +617,38 @@ struct ColiV4Engine {
     int active_sessions; /* sessions created against this engine */
 };
 
+typedef struct ColiV4DSparkRunner ColiV4DSparkRunner;
+
+/* Session ownership helpers shared by production session code and tests. */
+void coli_v4_engine_attach_session(ColiV4Engine *engine);
+void coli_v4_engine_detach_session(ColiV4Engine *engine);
+void coli_v4_session_take_runner(ColiV4Session *session,
+                                 ColiV4DSparkRunner *runner);
+void coli_v4_session_clear_runner(ColiV4Session *session);
+
+#include "tok.h"
+
+struct ColiV4Session {
+    ColiV4Engine *engine;
+    ColiDeepSeekV4Config config;
+    ColiDeepSeekV4WindowAttentionState **attention;
+    float *state;
+    float *next;
+    float *hidden;
+    float *main_x_batch;
+    int *prompt_ids;
+    int *generated;
+    int max_prompt_tokens;
+    int max_new_tokens_cap;
+    int prompt_count;
+    int generated_count;
+    ColiV4DSparkRunner *runner;
+    Tok tokenizer;
+    int tokenizer_ready;
+    char *text;
+    int text_length;
+};
+
 /* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap). */
 int coli_v4_expert_store_open_planned(
     ColiV4Engine *engine,
@@ -634,29 +666,18 @@ int coli_st_read_at_engine(ColiV4Engine *engine,
                            const ColiSafetensorsIndex *index, int shard,
                            uint64_t offset, size_t length, void *destination);
 
+#ifdef COLI_V4_TEST_HOOKS
 /*
- * Unit-test hooks (default 0). Production callers must leave these untouched.
- * Defined in deepseek_v4.c / deepseek_v4_dspark.c.
+ * Fault-injection / counters for ownership tests only.
+ * Compile ownership objects with -DCOLI_V4_TEST_HOOKS; production objects omit this.
  */
 extern int coli_v4_test_fail_expert_store_open;
 extern int coli_v4_test_skip_expert_store_open;
 extern int coli_v4_test_closed_owned_index;
-extern int coli_v4_test_runner_close_count;
-extern int coli_v4_test_fail_shared_heads;
 
-typedef struct ColiV4DSparkRunner ColiV4DSparkRunner;
-
-/* Lightweight session shell mirroring engine/session ownership for unit tests. */
-typedef struct ColiV4TestSession {
-    ColiV4Engine *engine;
-    ColiV4DSparkRunner *runner;
-} ColiV4TestSession;
-
-int coli_v4_test_session_shell_create(ColiV4TestSession **session,
-                                      ColiV4Engine *engine);
-void coli_v4_test_session_shell_destroy(ColiV4TestSession *session);
-/* Assign runner then fail shared-head bind (session_generate ownership order). */
-int coli_v4_test_session_shell_bind_runner_fail_shared(
-    ColiV4TestSession *session);
+ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine);
+void coli_v4_test_session_bare_destroy(ColiV4Session *session);
+ColiV4DSparkRunner *coli_v4_session_peek_runner(const ColiV4Session *session);
+#endif /* COLI_V4_TEST_HOOKS */
 
 #endif /* COLIBRI_DEEPSEEK_V4_INTERNAL_H */

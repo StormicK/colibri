@@ -469,13 +469,30 @@ tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4
 	$(CC) $(CFLAGS) native_quant.c -c -o native_quant.o
 	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
 
-# Engine/session ownership regressions (RUNTIME + CONFIG only).
-V4_OWNERSHIP_OBJS = COLI_V4_UNIT_RUNTIME.o COLI_V4_UNIT_CONFIG.o safetensors_index.o
-tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c deepseek_v4.c deepseek_v4.h \
-		deepseek_v4_internal.h
-	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) \
-		COLI_V4_UNIT_RUNTIME.o COLI_V4_UNIT_CONFIG.o safetensors_index.o
-	$(CC) $(CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
+# Engine/session ownership regressions — isolated objects under build/ownership/
+# so make -j cannot race with test_deepseek_v4 on shared .o names, and so
+# COLI_V4_TEST_HOOKS never enters production COLI_V4_UNIT_RUNTIME.o.
+V4_OWN_DIR = build/ownership
+V4_OWN_CFLAGS = $(CFLAGS) -DCOLI_V4_TEST_HOOKS
+V4_OWNERSHIP_OBJS = \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o \
+	$(V4_OWN_DIR)/safetensors_index.o
+
+$(V4_OWN_DIR):
+	mkdir -p $(V4_OWN_DIR)
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_RUNTIME -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_CONFIG -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/safetensors_index.o: safetensors_index.c safetensors_index.h | $(V4_OWN_DIR)
+	$(CC) $(CFLAGS) -c safetensors_index.c -o $@
+
+tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
+	$(CC) $(V4_OWN_CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
 endif
 
 test-c: $(TEST_BINS)

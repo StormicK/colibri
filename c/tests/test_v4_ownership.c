@@ -1,4 +1,5 @@
-/* Ownership / lifecycle regression tests for DeepSeek V4 engine + session. */
+/* Ownership / lifecycle regression tests for DeepSeek V4 engine + session.
+ * Built with -DCOLI_V4_TEST_HOOKS against objects under build/ownership/. */
 #include "../deepseek_v4_internal.h"
 #include "../compat.h"
 
@@ -8,7 +9,9 @@
 #include <string.h>
 #include <unistd.h>
 
-/* Stubs for symbols referenced by COLI_V4_UNIT_RUNTIME but unused in these tests. */
+int coli_v4_test_runner_close_count = 0;
+
+/* Stubs for symbols referenced by RUNTIME but unused in these tests. */
 int coli_v4_expert_store_open_planned(
     ColiV4Engine *engine,
     const ColiDeepSeekV4ExpertStoreOptions *options,
@@ -31,6 +34,13 @@ void coli_v4_layer_resident_reference_free(
 
 void coli_v4_dspark_heads_close(ColiV4DSparkHeads *heads) {
     (void)heads;
+}
+
+/* Ownership tests use blank runners; count closes through the real helper path. */
+void coli_v4_dspark_runner_close(ColiV4DSparkRunner *runner) {
+    if (!runner) return;
+    coli_v4_test_runner_close_count++;
+    free(runner);
 }
 
 static int write_all(int fd, const void *data, size_t length) {
@@ -159,7 +169,7 @@ static int test_engine_owns_model_path(void) {
         cleanup_fixture(directory);
         return 1;
     }
-    free(path); /* caller buffer released; engine must keep its copy */
+    free(path);
 
     const char *owned = coli_v4_engine_target_model_dir(engine);
     if (!owned || strcmp(owned, directory) != 0) {
@@ -182,7 +192,7 @@ static int test_engine_owns_model_path(void) {
     return 0;
 }
 
-static int test_session_blocks_engine_destroy(void) {
+static int test_session_lifetime_accounting(void) {
     char directory[128], error[256];
     if (make_fixture(directory, sizeof(directory))) return 1;
 
@@ -195,26 +205,26 @@ static int test_session_blocks_engine_destroy(void) {
         return 1;
     }
 
-    ColiV4TestSession *session = NULL;
-    if (coli_v4_test_session_shell_create(&session, engine)) {
-        fprintf(stderr, "session shell create failed\n");
+    ColiV4Session *session = coli_v4_test_session_bare_create(engine);
+    if (!session) {
+        fprintf(stderr, "bare session create failed\n");
         coli_v4_engine_destroy(engine);
         cleanup_fixture(directory);
         return 1;
     }
     if (engine->active_sessions != 1) {
-        fprintf(stderr, "expected active_sessions=1, got %d\n",
+        fprintf(stderr, "expected active_sessions=1 after attach, got %d\n",
                 engine->active_sessions);
-        coli_v4_test_session_shell_destroy(session);
+        coli_v4_test_session_bare_destroy(session);
         coli_v4_engine_destroy(engine);
         cleanup_fixture(directory);
         return 1;
     }
 
-    /* Must not destroy engine while a session is alive (debug assert). */
-    coli_v4_test_session_shell_destroy(session);
+    coli_v4_test_session_bare_destroy(session);
     if (engine->active_sessions != 0) {
-        fprintf(stderr, "expected active_sessions=0 after session destroy\n");
+        fprintf(stderr, "expected active_sessions=0 after detach, got %d\n",
+                engine->active_sessions);
         coli_v4_engine_destroy(engine);
         cleanup_fixture(directory);
         return 1;
@@ -222,7 +232,7 @@ static int test_session_blocks_engine_destroy(void) {
     coli_v4_engine_destroy(engine);
     coli_v4_test_skip_expert_store_open = 0;
     cleanup_fixture(directory);
-    puts("ownership: session lifetime gates engine destroy: ok");
+    puts("ownership: session lifetime accounting: ok");
     return 0;
 }
 
@@ -239,31 +249,34 @@ static int test_runner_closed_after_shared_heads_fail(void) {
         return 1;
     }
 
-    ColiV4TestSession *session = NULL;
-    if (coli_v4_test_session_shell_create(&session, engine)) {
+    ColiV4Session *session = coli_v4_test_session_bare_create(engine);
+    if (!session) {
         coli_v4_engine_destroy(engine);
         cleanup_fixture(directory);
         return 1;
     }
 
     coli_v4_test_runner_close_count = 0;
-    if (coli_v4_test_session_shell_bind_runner_fail_shared(session) == 0) {
-        fprintf(stderr, "expected shared-heads bind failure\n");
-        coli_v4_test_session_shell_destroy(session);
+    ColiV4DSparkRunner *runner = calloc(1, sizeof(void *) * 8);
+    if (!runner) {
+        coli_v4_test_session_bare_destroy(session);
         coli_v4_engine_destroy(engine);
         cleanup_fixture(directory);
         return 1;
     }
-    if (!session->runner) {
-        fprintf(stderr, "runner should remain owned by session after bind fail\n");
-        coli_v4_test_session_shell_destroy(session);
+    /* Mirror session_generate: take runner before shared-head bind fails. */
+    coli_v4_session_take_runner(session, runner);
+    if (!coli_v4_session_peek_runner(session)) {
+        fprintf(stderr, "session should own runner after take\n");
+        coli_v4_test_session_bare_destroy(session);
         coli_v4_engine_destroy(engine);
         cleanup_fixture(directory);
         return 1;
     }
-    coli_v4_test_session_shell_destroy(session);
+    /* Simulated shared-head bind failure: leave runner on session, then destroy. */
+    coli_v4_test_session_bare_destroy(session);
     if (coli_v4_test_runner_close_count != 1) {
-        fprintf(stderr, "expected runner close once, got %d\n",
+        fprintf(stderr, "expected runner close once via clear_runner, got %d\n",
                 coli_v4_test_runner_close_count);
         coli_v4_engine_destroy(engine);
         cleanup_fixture(directory);
@@ -279,7 +292,7 @@ static int test_runner_closed_after_shared_heads_fail(void) {
 int main(void) {
     if (test_index_closed_on_expert_fail()) return 1;
     if (test_engine_owns_model_path()) return 1;
-    if (test_session_blocks_engine_destroy()) return 1;
+    if (test_session_lifetime_accounting()) return 1;
     if (test_runner_closed_after_shared_heads_fail()) return 1;
     puts("DeepSeek-V4 ownership tests: ok");
     return 0;

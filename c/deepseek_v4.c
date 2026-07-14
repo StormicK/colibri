@@ -5600,12 +5600,62 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
 void coli_v4_layer_resident_reference_free(ColiV4Engine *engine,
                                            ColiDeepSeekV4LayerWeights *weights);
 void coli_v4_dspark_heads_close(ColiV4DSparkHeads *heads);
+void coli_v4_dspark_runner_close(ColiV4DSparkRunner *runner);
 
-/* Unit-test hooks (default off). */
+#ifdef COLI_V4_TEST_HOOKS
 int coli_v4_test_fail_expert_store_open = 0;
 int coli_v4_test_skip_expert_store_open = 0;
 int coli_v4_test_closed_owned_index = 0;
-int coli_v4_test_runner_close_count = 0;
+#endif
+
+void coli_v4_engine_attach_session(ColiV4Engine *engine) {
+    if (engine) engine->active_sessions++;
+}
+
+void coli_v4_engine_detach_session(ColiV4Engine *engine) {
+    if (!engine) return;
+    assert(engine->active_sessions > 0);
+    engine->active_sessions--;
+}
+
+void coli_v4_session_take_runner(ColiV4Session *session,
+                                 ColiV4DSparkRunner *runner) {
+    if (!session) return;
+    if (session->runner && session->runner != runner)
+        coli_v4_dspark_runner_close(session->runner);
+    session->runner = runner;
+}
+
+void coli_v4_session_clear_runner(ColiV4Session *session) {
+    if (!session || !session->runner) return;
+    coli_v4_dspark_runner_close(session->runner);
+    session->runner = NULL;
+}
+
+#ifdef COLI_V4_TEST_HOOKS
+ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine) {
+    if (!engine) return NULL;
+    ColiV4Session *session = calloc(1, sizeof(*session));
+    if (!session) return NULL;
+    session->engine = engine;
+    coli_v4_engine_attach_session(engine);
+    return session;
+}
+
+void coli_v4_test_session_bare_destroy(ColiV4Session *session) {
+    if (!session) return;
+    coli_v4_session_clear_runner(session);
+    if (session->engine) {
+        coli_v4_engine_detach_session(session->engine);
+        session->engine = NULL;
+    }
+    free(session);
+}
+
+ColiV4DSparkRunner *coli_v4_session_peek_runner(const ColiV4Session *session) {
+    return session ? session->runner : NULL;
+}
+#endif
 
 const ColiDeepSeekV4Config *coli_v4_engine_config(const ColiV4Engine *engine) {
     return engine ? &engine->config : NULL;
@@ -5687,7 +5737,9 @@ void coli_v4_engine_destroy(ColiV4Engine *engine) {
         engine->experts->ops->destroy(engine->experts);
     engine->experts = NULL;
     if (engine->owns_index && engine->target_index) {
+#ifdef COLI_V4_TEST_HOOKS
         coli_v4_test_closed_owned_index++;
+#endif
         coli_st_index_close(engine->target_index);
     }
     engine->target_index = NULL;
@@ -5743,25 +5795,34 @@ int coli_v4_engine_open(ColiV4Engine **output,
                            error_size))
         goto fail;
     engine->owns_index = 1;
+#ifdef COLI_V4_TEST_HOOKS
     if (coli_v4_test_fail_expert_store_open) {
         if (error && error_size)
             snprintf(error, error_size, "forced expert store open failure");
         goto fail;
     }
-    if (!coli_v4_test_skip_expert_store_open) {
-        if (coli_v4_expert_store_open_planned(
-                engine,
-                &(ColiDeepSeekV4ExpertStoreOptions){
-                    engine->runtime.target_model_dir,
-                    engine->config.num_hidden_layers,
-                    engine->config.n_routed_experts,
-                    4ULL << 30,
-                    engine->runtime.pin_slots_per_layer,
-                    engine->runtime.repin_interval},
-                &engine->experts, error, error_size))
-            goto fail;
-        engine->owns_experts = 1;
+    if (coli_v4_test_skip_expert_store_open) {
+        engine->summary.dense_resident = engine->runtime.dense_resident;
+        engine->summary.dspark_resident = engine->runtime.dspark_resident;
+        engine->summary.head_resident = engine->head_cache.data != NULL;
+        engine->summary.expert_cache_bytes =
+            engine->runtime.dspark_expert_cache_bytes;
+        *output = engine;
+        return 0;
     }
+#endif
+    if (coli_v4_expert_store_open_planned(
+            engine,
+            &(ColiDeepSeekV4ExpertStoreOptions){
+                engine->runtime.target_model_dir,
+                engine->config.num_hidden_layers,
+                engine->config.n_routed_experts,
+                4ULL << 30,
+                engine->runtime.pin_slots_per_layer,
+                engine->runtime.repin_interval},
+            &engine->experts, error, error_size))
+        goto fail;
+    engine->owns_experts = 1;
     engine->summary.dense_resident = engine->runtime.dense_resident;
     engine->summary.dspark_resident = engine->runtime.dspark_resident;
     engine->summary.head_resident = engine->head_cache.data != NULL;
@@ -5772,43 +5833,6 @@ int coli_v4_engine_open(ColiV4Engine **output,
 
 fail:
     coli_v4_engine_destroy(engine);
-    return -1;
-}
-
-int coli_v4_test_session_shell_create(ColiV4TestSession **output,
-                                      ColiV4Engine *engine) {
-    if (!output || !engine) return -1;
-    ColiV4TestSession *session = calloc(1, sizeof(*session));
-    if (!session) return -1;
-    session->engine = engine;
-    engine->active_sessions++;
-    *output = session;
-    return 0;
-}
-
-void coli_v4_test_session_shell_destroy(ColiV4TestSession *session) {
-    if (!session) return;
-    if (session->runner) {
-        /* Blank test runners are calloc'd placeholders; count like runner_close. */
-        coli_v4_test_runner_close_count++;
-        free(session->runner);
-        session->runner = NULL;
-    }
-    if (session->engine) {
-        assert(session->engine->active_sessions > 0);
-        session->engine->active_sessions--;
-        session->engine = NULL;
-    }
-    free(session);
-}
-
-int coli_v4_test_session_shell_bind_runner_fail_shared(
-    ColiV4TestSession *session) {
-    if (!session) return -1;
-    /* Mirror session_generate: assign runner before shared-head bind fails. */
-    ColiV4DSparkRunner *runner = calloc(1, sizeof(void *) * 8);
-    if (!runner) return -1;
-    session->runner = runner;
     return -1;
 }
 #endif /* COLI_V4_UNIT_RUNTIME */
@@ -6755,27 +6779,6 @@ static void v4_attention_free(ColiDeepSeekV4WindowAttentionState **attention,
     free(attention);
 }
 
-struct ColiV4Session {
-    ColiV4Engine *engine;
-    ColiDeepSeekV4Config config;
-    ColiDeepSeekV4WindowAttentionState **attention;
-    float *state;
-    float *next;
-    float *hidden;
-    float *main_x_batch;
-    int *prompt_ids;
-    int *generated;
-    int max_prompt_tokens;
-    int max_new_tokens_cap;
-    int prompt_count;
-    int generated_count;
-    ColiV4DSparkRunner *runner;
-    Tok tokenizer;
-    int tokenizer_ready;
-    char *text;
-    int text_length;
-};
-
 #include <assert.h>
 
 static void session_free_buffers(ColiV4Session *session) {
@@ -6797,15 +6800,11 @@ static void session_free_attention(ColiV4Session *session) {
 
 void coli_v4_session_destroy(ColiV4Session *session) {
     if (!session) return;
-    if (session->runner) {
-        coli_v4_dspark_runner_close(session->runner);
-        session->runner = NULL;
-    }
+    coli_v4_session_clear_runner(session);
     session_free_attention(session);
     session_free_buffers(session);
     if (session->engine) {
-        assert(session->engine->active_sessions > 0);
-        session->engine->active_sessions--;
+        coli_v4_engine_detach_session(session->engine);
         session->engine = NULL;
     }
     free(session);
@@ -6827,7 +6826,7 @@ int coli_v4_session_create(ColiV4Session **output, ColiV4Engine *engine,
         return -1;
     }
     session->engine = engine;
-    engine->active_sessions++;
+    coli_v4_engine_attach_session(engine);
     session->config = *coli_v4_engine_config(engine);
     session->max_prompt_tokens =
         options && options->max_prompt_tokens > 0 ? options->max_prompt_tokens
@@ -6938,10 +6937,7 @@ int coli_v4_session_generate(ColiV4Session *session,
     session->text_length = 0;
     session->prompt_count = 0;
     session->generated_count = 0;
-    if (session->runner) {
-        coli_v4_dspark_runner_close(session->runner);
-        session->runner = NULL;
-    }
+    coli_v4_session_clear_runner(session);
     for (int layer = 0; layer < session->config.num_hidden_layers; layer++)
         coli_v4_window_attention_reset(session->attention[layer]);
 
@@ -6999,7 +6995,7 @@ int coli_v4_session_generate(ColiV4Session *session,
         if (coli_v4_dspark_runner_open(&runner, session->engine, draft, target,
                                        config, 256ULL << 20, error, error_size))
             return -1;
-        session->runner = runner;
+        coli_v4_session_take_runner(session, runner);
         if (coli_v4_dspark_runner_use_shared_heads(
                 runner, coli_v4_dspark_capture_heads(engine)))
             return -1;
