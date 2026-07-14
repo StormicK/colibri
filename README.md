@@ -91,6 +91,23 @@ This is not fast. It is a 744B frontier-class model **answering correctly on a m
 ### SSD note
 Cold starts are heavy on random reads (~11 GB/token), but reads don't meaningfully wear an SSD — colibrì's streaming is read-only. The real concerns under heavy use are (1) **swap traffic** if the system runs out of RAM (writes do wear the drive — keep a sane `--ram` budget; colibrì's auto-budget is designed to stay clear of swap) and (2) **sustained thermals**: hours at full read duty cycle will heat cheaper drives. Monitor drive temperature and health.
 
+## DeepSeek V4
+
+Experimental CPU path for **DeepSeek V4 Flash + DSpark** (native FP4 experts,
+automatic RAM planning, speculative decode). Built as GLM-style amalgams
+(`c/deepseek_v4.c`, `c/deepseek_v4_dspark.c`); supported on **x86-64 Linux and
+Windows/MSYS2** only — other platforms keep validating GLM via `make check`.
+
+```bash
+cd c
+make deepseek-v4
+python ./v4 run --model /path/to/DeepSeek-V4-Flash-DSpark --ram 32 \
+  --stop-sentence "What is the capital of France?"
+```
+
+Full status, benches, oracle validation, and options:
+**[docs/deepseek-v4.md](docs/deepseek-v4.md)**.
+
 ## Download the model
 
 A pre-converted **GLM-5.2 int4** model for colibrì is available on Hugging Face — **use the version with the int8 MTP heads** (matey-0's clone):
@@ -647,6 +664,8 @@ Every contribution, from a datapoint to a disk, moves the ceiling.
 Makefile                  root build/check entry point
 c/
 ├── glm.c                 single-file GLM engine
+├── deepseek_v4*.c/.h     DeepSeek V4 + DSpark amalgams (x86-64 Linux/MSYS2)
+├── v4                    DeepSeek V4 CLI launcher (stdlib Python)
 ├── st.h, tok.h, json.h   runtime headers
 ├── backend_cuda.*        optional CUDA tier
 ├── Makefile              build and local checks
@@ -656,6 +675,8 @@ c/
 ├── tools/                offline conversion, fixtures and benchmarks
 ├── scripts/              long-running conversion helpers
 └── tests/                dependency-free C and Python tests
+docs/
+└── deepseek-v4.md        DeepSeek V4 status, build, run, oracle
 web/                      browser UI (pure OpenAI-API client, community-maintained)
 ```
 

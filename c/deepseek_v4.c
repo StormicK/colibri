@@ -5698,6 +5698,7 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 #include "deepseek_v4.h"
 #include "deepseek_v4.h"
 #include "deepseek_v4.h"
+#include "json.h"
 #include "native_quant.h"
 #include "safetensors_index.h"
 #include "tensor_io.h"
@@ -6320,8 +6321,13 @@ typedef struct {
     const char *draft_model_dir;
     const char *prompt;
     const char *system_prompt;
+    const char *oracle_path;
+    const char *record_oracle_path;
     int max_new_tokens;
+    int teacher_forcing;
+    int greedy;
     int stop_sentence;
+    int no_dspark;
     double memory_gib;
     ColiDeepSeekV4PromptMode prompt_mode;
 } V4CliOptions;
@@ -6329,14 +6335,20 @@ typedef struct {
 static void v4_cli_usage(FILE *stream, const char *program) {
     fprintf(stream,
         "usage: %s MODEL PROMPT [options]\n"
+        "       %s MODEL --oracle FILE [--teacher-forcing N] [--greedy N] [options]\n"
         "  --max-tokens N       maximum generated tokens (default: 128)\n"
         "  --memory-gb GiB      cap this process; otherwise use available RAM\n"
         "  --draft-model PATH   separate DSpark checkpoint (default: MODEL)\n"
         "  --system TEXT        optional system message\n"
         "  --thinking           enable the official V4 thinking prefix\n"
         "  --raw-prompt         bypass the default V4 chat template\n"
-        "  --stop-sentence      stop after the first sentence terminator\n",
-        program);
+        "  --stop-sentence      stop after the first sentence terminator\n"
+        "  --no-dspark          disable speculative decode (greedy target only)\n"
+        "  --oracle FILE        validate against an oracle JSON fixture\n"
+        "  --teacher-forcing N  oracle: compare top-1 on N prompt positions\n"
+        "  --greedy N           oracle: compare N greedy continuation tokens\n"
+        "  --record-oracle FILE write greedy tokens + tf_pred to JSON\n",
+        program, program);
 }
 
 static int v4_cli_positive_int(const char *text, int *output) {
@@ -6362,10 +6374,14 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
     memset(options, 0, sizeof(*options));
     options->model_dir = argv[1];
     options->draft_model_dir = argv[1];
-    options->prompt = argv[2];
     options->max_new_tokens = 128;
     options->prompt_mode = COLI_V4_PROMPT_CHAT;
-    for (int i = 3; i < argc; i++) {
+    int argi = 2;
+    if (argv[2][0] != '-') {
+        options->prompt = argv[2];
+        argi = 3;
+    }
+    for (int i = argi; i < argc; i++) {
         const char *option = argv[i];
         if (!strcmp(option, "--max-tokens")) {
             if (++i == argc ||
@@ -6388,11 +6404,193 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
             options->prompt_mode = COLI_V4_PROMPT_RAW;
         } else if (!strcmp(option, "--stop-sentence")) {
             options->stop_sentence = 1;
+        } else if (!strcmp(option, "--no-dspark")) {
+            options->no_dspark = 1;
+        } else if (!strcmp(option, "--oracle")) {
+            if (++i == argc || !argv[i][0]) return -1;
+            options->oracle_path = argv[i];
+        } else if (!strcmp(option, "--record-oracle")) {
+            if (++i == argc || !argv[i][0]) return -1;
+            options->record_oracle_path = argv[i];
+        } else if (!strcmp(option, "--teacher-forcing")) {
+            if (++i == argc ||
+                v4_cli_positive_int(argv[i], &options->teacher_forcing))
+                return -1;
+        } else if (!strcmp(option, "--greedy")) {
+            if (++i == argc ||
+                v4_cli_positive_int(argv[i], &options->greedy))
+                return -1;
         } else {
             return -1;
         }
     }
+    if (options->oracle_path) {
+        if (options->prompt || options->record_oracle_path) return -1;
+        if (!options->teacher_forcing) options->teacher_forcing = 32;
+        if (!options->greedy) options->greedy = 20;
+        options->no_dspark = 1;
+    } else if (!options->prompt) {
+        return -1;
+    }
     return 0;
+}
+
+static int *v4_oracle_read_ids(jval *root, const char *key, int *count) {
+    jval *array = json_get(root, key);
+    if (!array || array->t != J_ARR || array->len < 1) return NULL;
+    int *ids = malloc((size_t)array->len * sizeof(*ids));
+    if (!ids) return NULL;
+    for (int i = 0; i < array->len; i++) {
+        if (!array->kids[i] || array->kids[i]->t != J_NUM) {
+            free(ids);
+            return NULL;
+        }
+        ids[i] = (int)array->kids[i]->num;
+    }
+    *count = array->len;
+    return ids;
+}
+
+static int v4_oracle_write_json(const char *path, const char *source,
+                                const char *model_dir, const char *prompt,
+                                const int *prompt_ids, int prompt_count,
+                                const int *full_ids, int full_count,
+                                const int *tf_pred, int tf_count) {
+    FILE *out = fopen(path, "wb");
+    if (!out) return -1;
+    fprintf(out,
+            "{\n  \"source\": \"%s\",\n  \"model\": \"%s\",\n  \"prompt\": ",
+            source, model_dir);
+    fputc('"', out);
+    for (const char *p = prompt ? prompt : ""; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '\\' || c == '"') fputc('\\', out);
+        if (c == '\n') { fputs("\\n", out); continue; }
+        if (c == '\r') { fputs("\\r", out); continue; }
+        if (c == '\t') { fputs("\\t", out); continue; }
+        fputc(c, out);
+    }
+    fputs("\",\n  \"comparison\": {\n"
+          "    \"top1_token\": \"exact\",\n"
+          "    \"logits\": \"not required for coli-self fixtures\",\n"
+          "    \"dspark\": \"greedy tokens must match --no-dspark\"\n"
+          "  },\n  \"prompt_ids\": [", out);
+    for (int i = 0; i < prompt_count; i++)
+        fprintf(out, "%s%d", i ? ", " : "", prompt_ids[i]);
+    fputs("],\n  \"full_ids\": [", out);
+    for (int i = 0; i < full_count; i++)
+        fprintf(out, "%s%d", i ? ", " : "", full_ids[i]);
+    fputs("],\n  \"tf_pred\": [", out);
+    for (int i = 0; i < tf_count; i++)
+        fprintf(out, "%s%d", i ? ", " : "", tf_pred[i]);
+    fputs("]\n}\n", out);
+    fclose(out);
+    return 0;
+}
+
+static void v4_attention_free(ColiDeepSeekV4WindowAttentionState **attention,
+                              int layers) {
+    if (!attention) return;
+    for (int layer = 0; layer < layers; layer++)
+        coli_v4_window_attention_destroy(attention[layer]);
+    free(attention);
+}
+
+static int v4_oracle_teacher_forcing(
+        const int *full_ids, int full_count, const int *expected, int expect_count,
+        ColiDeepSeekV4WindowAttentionState **attention,
+        const ColiSafetensorsIndex *index, const ColiDeepSeekV4Config *config,
+        ColiExpertStore *experts, char *error, size_t error_size,
+        int *matched_out) {
+    size_t hd = (size_t)config->hc_mult * config->hidden_size;
+    float *state = malloc((size_t)full_count * hd * sizeof(float));
+    float *next = malloc((size_t)full_count * hd * sizeof(float));
+    float *hidden = malloc((size_t)config->hidden_size * sizeof(float));
+    if (!state || !next || !hidden) {
+        free(state); free(next); free(hidden);
+        return -1;
+    }
+    for (int item = 0; item < full_count; item++)
+        if (load_embedding(state + (size_t)item * hd, index, config,
+                           full_ids[item])) {
+            free(state); free(next); free(hidden);
+            return -1;
+        }
+    if (target_batch(&state, &next, attention, index, config, experts,
+                     full_ids, 0, full_count, error, error_size)) {
+        free(state); free(next); free(hidden);
+        return -1;
+    }
+    int limit = expect_count < full_count ? expect_count : full_count;
+    int matched = 0;
+    for (int pos = 0; pos < limit; pos++) {
+        int pred = -1;
+        float logit = 0.0f;
+        if (final_hidden(hidden, state + (size_t)pos * hd, index, config,
+                         error, error_size) ||
+            head_argmax(hidden, index, config, &pred, &logit)) {
+            free(state); free(next); free(hidden);
+            return -1;
+        }
+        if (pred == expected[pos]) matched++;
+        else
+            fprintf(stderr,
+                    "[ORACLE] TF mismatch pos=%d expected=%d got=%d logit=%.6g\n",
+                    pos, expected[pos], pred, logit);
+    }
+    free(state); free(next); free(hidden);
+    *matched_out = matched;
+    return 0;
+}
+
+static int v4_oracle_greedy_from_prompt(
+        const int *prompt_ids, int prompt_count, int *generated, int max_new,
+        ColiDeepSeekV4WindowAttentionState **attention,
+        const ColiSafetensorsIndex *index, const ColiDeepSeekV4Config *config,
+        ColiExpertStore *experts, char *error, size_t error_size) {
+    size_t hd = (size_t)config->hc_mult * config->hidden_size;
+    float *state = malloc((size_t)prompt_count * hd * sizeof(float));
+    float *next = malloc((size_t)prompt_count * hd * sizeof(float));
+    float *hidden = malloc((size_t)config->hidden_size * sizeof(float));
+    if (!state || !next || !hidden) {
+        free(state); free(next); free(hidden);
+        return -1;
+    }
+    for (int item = 0; item < prompt_count; item++)
+        if (load_embedding(state + (size_t)item * hd, index, config,
+                           prompt_ids[item])) {
+            free(state); free(next); free(hidden);
+            return -1;
+        }
+    if (target_batch(&state, &next, attention, index, config, experts,
+                     prompt_ids, 0, prompt_count, error, error_size)) {
+        free(state); free(next); free(hidden);
+        return -1;
+    }
+    int current = -1;
+    float logit = 0.0f;
+    if (final_hidden(hidden, state + (size_t)(prompt_count - 1) * hd,
+                     index, config, error, error_size) ||
+        head_argmax(hidden, index, config, &current, &logit)) {
+        free(state); free(next); free(hidden);
+        return -1;
+    }
+    int count = 0;
+    generated[count++] = current;
+    int position = prompt_count;
+    while (count < max_new && current != 1) {
+        if (target_token(&state, &next, attention, index, config, experts,
+                         current, position, error, error_size) ||
+            final_hidden(hidden, state, index, config, error, error_size) ||
+            head_argmax(hidden, index, config, &current, &logit)) {
+            free(state); free(next); free(hidden);
+            return -1;
+        }
+        generated[count++] = current;
+        position++;
+    }
+    free(state); free(next); free(hidden);
+    return count;
 }
 
 static int spec_print(Tok *tokenizer, int token, float logit,
@@ -6423,20 +6621,6 @@ int main(int argc, char **argv) {
         runtime->memory_limit_bytes =
             (uint64_t)(cli.memory_gib * 1073741824.0);
 
-    char *prompt = NULL;
-    size_t prompt_length = 0;
-    if (coli_v4_prompt_build(&prompt, &prompt_length, cli.prompt,
-                             cli.system_prompt, cli.prompt_mode) ||
-        prompt_length > INT_MAX - 16) {
-        fprintf(stderr, "cannot build DeepSeek V4 prompt\n");
-        return 1;
-    }
-    fprintf(stderr, "v4_cli mode=%s memory=%s draft_model=%s\n",
-            cli.prompt_mode == COLI_V4_PROMPT_RAW ? "raw" :
-            cli.prompt_mode == COLI_V4_PROMPT_THINKING ? "thinking" : "chat",
-            cli.memory_gib > 0.0 ? "limited" : "auto",
-            cli.draft_model_dir);
-
     char error[512] = {0}, tokenizer_path[4096];
     ColiDeepSeekV4Config config; ColiSafetensorsIndex *index = NULL;
     ColiExpertStore *experts = NULL; ColiV4DSparkRunner *runner = NULL;
@@ -6451,6 +6635,100 @@ int main(int argc, char **argv) {
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
              cli.model_dir);
     Tok tokenizer; tok_load(&tokenizer, tokenizer_path);
+
+    if (cli.oracle_path) {
+        FILE *oracle_file = fopen(cli.oracle_path, "rb");
+        if (!oracle_file) { perror(cli.oracle_path); return 1; }
+        fseek(oracle_file, 0, SEEK_END);
+        long oracle_bytes = ftell(oracle_file);
+        fseek(oracle_file, 0, SEEK_SET);
+        char *oracle_text = malloc((size_t)oracle_bytes + 1);
+        if (!oracle_text ||
+            fread(oracle_text, 1, (size_t)oracle_bytes, oracle_file) !=
+                (size_t)oracle_bytes) {
+            fclose(oracle_file);
+            free(oracle_text);
+            return 1;
+        }
+        oracle_text[oracle_bytes] = 0;
+        fclose(oracle_file);
+        char *arena = NULL;
+        jval *root = json_parse(oracle_text, &arena);
+        free(oracle_text);
+        int prompt_count = 0, full_count = 0, tf_count = 0;
+        int *prompt_ids = v4_oracle_read_ids(root, "prompt_ids", &prompt_count);
+        int *full_ids = v4_oracle_read_ids(root, "full_ids", &full_count);
+        int *tf_pred = v4_oracle_read_ids(root, "tf_pred", &tf_count);
+        if (!prompt_ids || !full_ids || !tf_pred ||
+            prompt_count < 1 || full_count <= prompt_count ||
+            tf_count < 1) {
+            fprintf(stderr, "invalid oracle fixture: %s\n", cli.oracle_path);
+            return 1;
+        }
+        ColiDeepSeekV4WindowAttentionState **attention = calloc(
+            (size_t)config.num_hidden_layers, sizeof(*attention));
+        if (!attention) return 1;
+        for (int layer = 0; layer < config.num_hidden_layers; layer++)
+            if (coli_v4_window_attention_create(&attention[layer], &config))
+                return 1;
+
+        int tf_limit = cli.teacher_forcing;
+        if (tf_limit > tf_count) tf_limit = tf_count;
+        if (tf_limit > full_count) tf_limit = full_count;
+        int tf_matched = 0;
+        if (v4_oracle_teacher_forcing(full_ids, full_count, tf_pred, tf_limit,
+                                      attention, index, &config, experts,
+                                      error, sizeof(error), &tf_matched)) {
+            fprintf(stderr, "%s\n", error);
+            return 1;
+        }
+        printf("PREFILL (teacher-forcing) C vs oracle: %d/%d positions\n",
+               tf_matched, tf_limit);
+
+        for (int layer = 0; layer < config.num_hidden_layers; layer++)
+            coli_v4_window_attention_reset(attention[layer]);
+        int greedy_limit = cli.greedy;
+        int *generated = malloc((size_t)(greedy_limit + 8) * sizeof(int));
+        int got = v4_oracle_greedy_from_prompt(
+            prompt_ids, prompt_count, generated, greedy_limit, attention,
+            index, &config, experts, error, sizeof(error));
+        if (got < 0) {
+            fprintf(stderr, "%s\n", error);
+            return 1;
+        }
+        int greedy_matched = 0;
+        int continue_count = full_count - prompt_count;
+        int compare = got < greedy_limit ? got : greedy_limit;
+        if (compare > continue_count) compare = continue_count;
+        for (int i = 0; i < compare; i++) {
+            int expected = full_ids[prompt_count + i];
+            if (generated[i] == expected) greedy_matched++;
+            else
+                fprintf(stderr,
+                        "[ORACLE] greedy mismatch i=%d expected=%d got=%d\n",
+                        i, expected, generated[i]);
+        }
+        printf("GREEDY C vs oracle: %d/%d tokens\n", greedy_matched, compare);
+        v4_attention_free(attention, config.num_hidden_layers);
+        free(generated); free(prompt_ids); free(full_ids); free(tf_pred);
+        (void)process_started;
+        return (tf_matched == tf_limit && greedy_matched == compare) ? 0 : 1;
+    }
+
+    char *prompt = NULL;
+    size_t prompt_length = 0;
+    if (coli_v4_prompt_build(&prompt, &prompt_length, cli.prompt,
+                             cli.system_prompt, cli.prompt_mode) ||
+        prompt_length > INT_MAX - 16) {
+        fprintf(stderr, "cannot build DeepSeek V4 prompt\n");
+        return 1;
+    }
+    fprintf(stderr, "v4_cli mode=%s memory=%s draft_model=%s no_dspark=%d\n",
+            cli.prompt_mode == COLI_V4_PROMPT_RAW ? "raw" :
+            cli.prompt_mode == COLI_V4_PROMPT_THINKING ? "thinking" : "chat",
+            cli.memory_gib > 0.0 ? "limited" : "auto",
+            cli.draft_model_dir, cli.no_dspark);
+
     int prompt_capacity = (int)prompt_length + 16;
     int *prompt_ids = malloc((size_t)prompt_capacity * sizeof(int));
     int *generated = malloc((size_t)(max_new + 64) * sizeof(int));
@@ -6487,17 +6765,21 @@ int main(int argc, char **argv) {
     if (coli_v4_dspark_capture_main_x(main_x_batch, prompt_count, &config))
         return 1;
     double capture_done = spec_now();
-    if (coli_v4_dspark_runner_open(&runner, cli.draft_model_dir, cli.model_dir,
-                                   &config,
-                                   256ULL << 20, error, sizeof(error)) ||
-        coli_v4_dspark_runner_use_shared_heads(
-            runner, coli_v4_dspark_capture_heads())) {
-        fprintf(stderr, "%s\n", error); return 1;
+    if (!cli.no_dspark) {
+        if (coli_v4_dspark_runner_open(&runner, cli.draft_model_dir, cli.model_dir,
+                                       &config,
+                                       256ULL << 20, error, sizeof(error)) ||
+            coli_v4_dspark_runner_use_shared_heads(
+                runner, coli_v4_dspark_capture_heads())) {
+            fprintf(stderr, "%s\n", error); return 1;
+        }
     }
     double dspark_open_done = spec_now();
-    if (coli_v4_dspark_runner_prefill(runner, main_x_batch, 0, prompt_count,
-                                      error, sizeof(error))) {
-        fprintf(stderr, "%s\n", error); return 1;
+    if (!cli.no_dspark) {
+        if (coli_v4_dspark_runner_prefill(runner, main_x_batch, 0, prompt_count,
+                                          error, sizeof(error))) {
+            fprintf(stderr, "%s\n", error); return 1;
+        }
     }
     double dspark_prefill_done = spec_now();
     const float *last = state + (size_t)(prompt_count - 1) * hd;
@@ -6513,7 +6795,8 @@ int main(int argc, char **argv) {
 
     ColiV4SpeculativeController controller;
     coli_v4_speculative_controller_init(&controller, 10, 0.35f);
-    int block = coli_v4_dspark_runner_block_size(runner);
+    if (cli.no_dspark) controller.enabled = 0;
+    int block = runner ? coli_v4_dspark_runner_block_size(runner) : 0;
     int drafts[64], verified[65]; float draft_logits[64];
     double target_single_seconds = 0.0, decode_head_seconds = 0.0;
     double draft_seconds = 0.0, verify_seconds = 0.0, commit_seconds = 0.0;
@@ -6775,6 +7058,60 @@ int main(int argc, char **argv) {
            (unsigned long long)decode_stats.prefetch_hits);
     fprintf(stderr, "timing time_to_first_token=%.3fs after_first=%.3fs total=%.3fs\n",
            first_at - setup_done, decode_seconds, ended - setup_done);
+    if (cli.record_oracle_path) {
+        int full_count = prompt_count + generated_count;
+        int *full_ids = malloc((size_t)full_count * sizeof(int));
+        int *tf_pred = malloc((size_t)full_count * sizeof(int));
+        if (!full_ids || !tf_pred) return 1;
+        memcpy(full_ids, prompt_ids, (size_t)prompt_count * sizeof(int));
+        memcpy(full_ids + prompt_count, generated,
+               (size_t)generated_count * sizeof(int));
+        for (int layer = 0; layer < config.num_hidden_layers; layer++)
+            coli_v4_window_attention_reset(attention[layer]);
+        /* Rebuild tf_pred for the fixture (argmax at each position). */
+        size_t hd_tf = (size_t)config.hc_mult * config.hidden_size;
+        float *tf_state = malloc((size_t)full_count * hd_tf * sizeof(float));
+        float *tf_next = malloc((size_t)full_count * hd_tf * sizeof(float));
+        float *tf_hidden = malloc((size_t)config.hidden_size * sizeof(float));
+        if (!tf_state || !tf_next || !tf_hidden) return 1;
+        for (int item = 0; item < full_count; item++)
+            if (load_embedding(tf_state + (size_t)item * hd_tf, index, &config,
+                               full_ids[item])) return 1;
+        if (target_batch(&tf_state, &tf_next, attention, index, &config, experts,
+                         full_ids, 0, full_count, error, sizeof(error))) {
+            fprintf(stderr, "%s\n", error); return 1;
+        }
+        for (int pos = 0; pos < full_count; pos++) {
+            float logit = 0.0f;
+            if (final_hidden(tf_hidden, tf_state + (size_t)pos * hd_tf,
+                             index, &config, error, sizeof(error)) ||
+                head_argmax(tf_hidden, index, &config, &tf_pred[pos], &logit))
+                return 1;
+        }
+        free(tf_state); free(tf_next); free(tf_hidden);
+        /* Chat-template prompt tokens need not be model-greedy; only score
+         * the continuation window that record actually generated. */
+        int tf_matched = 0, tf_total = generated_count;
+        for (int i = 0; i < generated_count; i++) {
+            int pos = prompt_count - 1 + i;
+            if (pos >= 0 && pos < full_count - 1 &&
+                tf_pred[pos] == full_ids[pos + 1])
+                tf_matched++;
+        }
+        if (v4_oracle_write_json(cli.record_oracle_path, "coli-self",
+                                 cli.model_dir, cli.prompt,
+                                 prompt_ids, prompt_count,
+                                 full_ids, full_count,
+                                 tf_pred, full_count)) {
+            fprintf(stderr, "cannot write oracle %s\n", cli.record_oracle_path);
+            return 1;
+        }
+        fprintf(stderr,
+                "wrote oracle %s (source=coli-self, "
+                "continuation_self_check=%d/%d)\n",
+                cli.record_oracle_path, tf_matched, tf_total);
+        free(full_ids); free(tf_pred);
+    }
     return 0;
 }
 #endif /* COLI_V4_UNIT_GENERATE_STATS */

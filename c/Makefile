@@ -154,16 +154,32 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-V4_TEST_BINS = tests/test_model_interfaces$(EXE) \
+
+# DeepSeek V4 amalgamation needs GNU ld --wrap and x86-64 -march; keep it off
+# macOS / PowerPC / other hosts so `make check` still validates GLM + infra.
+COLI_V4_SUPPORTED :=
+ifeq ($(IS_WIN),1)
+COLI_V4_SUPPORTED := 1
+else ifeq ($(UNAME_S),Linux)
+ifneq (,$(filter x86_64 amd64,$(UNAME_M)))
+COLI_V4_SUPPORTED := 1
+endif
+endif
+
+# Shared V4-era infra tests are portable; the amalgam unit binary is gated.
+V4_INFRA_TEST_BINS = tests/test_model_interfaces$(EXE) \
 	tests/test_safetensors_index$(EXE) tests/test_native_quant$(EXE) \
-	tests/test_tensor_io$(EXE) tests/test_deepseek_v4$(EXE)
+	tests/test_tensor_io$(EXE)
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) \
 	tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) \
 	tests/test_decode_batch$(EXE) tests/test_idot$(EXE) \
 	tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) \
-	tests/test_compat_direct$(EXE) $(V4_TEST_BINS)
+	tests/test_compat_direct$(EXE) $(V4_INFRA_TEST_BINS)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
+endif
+ifeq ($(COLI_V4_SUPPORTED),1)
+TEST_BINS += tests/test_deepseek_v4$(EXE)
 endif
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
@@ -204,9 +220,31 @@ endif
 
 all: glm$(EXE)
 
-.PHONY: deepseek-v4
+.PHONY: deepseek-v4 deepseek-v4-oracle
+ifeq ($(COLI_V4_SUPPORTED),1)
 deepseek-v4:
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
+
+# Full-model oracle (not part of light `make check`). Requires MODEL=...
+# Example:
+#   make deepseek-v4-oracle MODEL=/path/to/DeepSeek-V4-Flash-DSpark
+deepseek-v4-oracle: deepseek-v4
+	@test -n "$(MODEL)" || { echo "usage: make deepseek-v4-oracle MODEL=/path/to/checkpoint" >&2; exit 2; }
+	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--output tests/deepseek_v4_oracle.json \
+		--prompt "$(or $(ORACLE_PROMPT),What is the capital of France?)" \
+		--max-new $(or $(ORACLE_MAX_NEW),32) \
+		$(if $(MEMORY_GB),--memory-gb $(MEMORY_GB),) \
+		--validate --teacher-forcing $(or $(ORACLE_TF),32) \
+		--greedy $(or $(ORACLE_GREEDY),20) \
+		--check-dspark
+else
+deepseek-v4:
+	@echo "deepseek-v4 is supported only on x86-64 Linux and Windows/MSYS2" >&2; exit 1
+deepseek-v4-oracle:
+	@echo "deepseek-v4-oracle is supported only on x86-64 Linux and Windows/MSYS2" >&2; exit 1
+endif
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
@@ -411,6 +449,7 @@ tools/deepseek_v4_first_token$(EXE): tools/deepseek_v4_first_token.c tok.h tok_u
 		deepseek_v4_sparse_attention.c deepseek_v4_expert.c \
 		deepseek_v4_expert_store.c deepseek_v4_block.c $< \
 		-o $@ -pthread $(LDFLAGS)
+ifeq ($(COLI_V4_SUPPORTED),1)
 # Merged DeepSeek V4 unit tests — objects from amalgamated units (test-only + deps).
 include Makefile.deepseek-v4.units
 V4_TEST_LINK_OBJS = \
@@ -429,6 +468,7 @@ tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4
 		safetensors_index.o
 	$(CC) $(CFLAGS) native_quant.c -c -o native_quant.o
 	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
+endif
 
 test-c: $(TEST_BINS)
 	$(PYTHON) tools/run_tests.py $(TEST_BINS)
@@ -463,7 +503,7 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all glm deepseek-v4 cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench \
+.PHONY: all glm deepseek-v4 deepseek-v4-oracle cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench \
 	probe-v4-layers probe-v4-attention probe-v4-block probe-v4-compressor \
 	probe-v4-ratio4-compressor probe-v4-indexer probe-v4-attention-sequence \
 	deepseek-v4-first-token deepseek-v4-tokenizer

@@ -49,6 +49,8 @@ c/glm_tiny_i4/
 c/glm_tiny_mix/
 c/glm_bench_medium/
 c/bench/
+c/tests/deepseek_v4_oracle.json
+c/tests/deepseek_v4_oracle.tmp_ids.json
 
 # pesi modello / artefatti di run
 *.safetensors

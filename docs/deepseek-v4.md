@@ -107,6 +107,15 @@ row as a guarantee for 8 GiB hardware.
 
 ## Build
 
+Supported platforms for the V4 engine and its amalgam unit tests:
+
+- x86-64 Linux (gcc + GNU ld `--wrap`)
+- Windows / MSYS2 UCRT64 (same)
+
+macOS, PowerPC, and other hosts keep validating GLM via `make check` and do
+**not** build or link DeepSeek V4. On unsupported platforms `make deepseek-v4`
+exits with a clear error.
+
 ```bash
 # MSYS2 UCRT64
 export PATH=/ucrt64/bin:/usr/bin
@@ -120,6 +129,46 @@ Amalgamated sources are compiled per former top-level unit via
 `-DCOLI_V4_UNIT_*` so onion `#include` + macro wraps stay correct. Shared
 kernels (`native_quant*`, `safetensors_index`, `tensor_io`) remain separate
 translation units.
+
+## Oracle validation (not in light CI)
+
+Upstream expects targeted, token-level checks. V4 unit tests cover config /
+stores / math; full-model correctness is a separate heavy path:
+
+```bash
+cd c
+make deepseek-v4-oracle MODEL=/path/to/DeepSeek-V4-Flash-DSpark MEMORY_GB=32
+# or:
+python tools/make_deepseek_v4_oracle.py \
+  --model /path/to/DeepSeek-V4-Flash-DSpark \
+  --binary ./deepseek_v4.exe \
+  --output tests/deepseek_v4_oracle.json \
+  --validate --teacher-forcing 32 --greedy 20 --check-dspark
+```
+
+```text
+./deepseek_v4 MODEL --oracle tests/deepseek_v4_oracle.json \
+  --teacher-forcing 32 --greedy 20 --memory-gb 32
+```
+
+### Comparison contract
+
+| Check | Criterion |
+|-------|-----------|
+| Teacher-forcing | top-1 token exact: N/N positions vs `tf_pred` |
+| Greedy | top-1 token exact: N/N continuation tokens vs `full_ids` |
+| DSpark on/off | greedy token sequences identical (`--check-dspark`) |
+| Logits / top-k | reserved for `source=transformers` fixtures |
+
+Fixture `source` field:
+
+- `coli-self` — recorded by the C engine with `--no-dspark` (default when
+  Hugging Face DeepSeek V4 is unavailable). Proves reproducibility and that
+  speculative decode matches the target greedy path; **not** HF bit-exact.
+- `transformers` — official implementation when
+  `DeepseekV4ForCausalLM` loads (`--prefer-transformers`).
+
+Oracle JSON is local/generated; it is not required for `make check`.
 
 ## Run
 
@@ -151,6 +200,8 @@ Default non-thinking encoding:
 
 ## Todo
 
+- [ ] **transformers oracle**: prefer `source=transformers` once HF DeepSeek V4
+      loads reliably on this checkpoint; keep coli-self for DSpark identity
 - [ ] **16 GiB performance**: close the decode gap vs 32 GiB (cache, pinning, I/O overlap)
 - [ ] **Model quantization**: more aggressive weight/activation paths for footprint and bandwidth
 - [ ] **Server**: HTTP / OpenAI-compatible API for multi-client use
