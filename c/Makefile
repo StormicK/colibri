@@ -156,24 +156,7 @@ endif
 CUDA_OBJ  =
 V4_TEST_BINS = tests/test_model_interfaces$(EXE) \
 	tests/test_safetensors_index$(EXE) tests/test_native_quant$(EXE) \
-	tests/test_deepseek_v4_expert_store$(EXE) \
-	tests/test_deepseek_v4_math$(EXE) tests/test_deepseek_v4_expert$(EXE) \
-	tests/test_deepseek_v4_config$(EXE) tests/test_tensor_io$(EXE) \
-	tests/test_deepseek_v4_layer$(EXE) \
-	tests/test_deepseek_v4_sparse_attention$(EXE) \
-	tests/test_deepseek_v4_kv_cache$(EXE) \
-	tests/test_deepseek_v4_attention_cache$(EXE) \
-	tests/test_deepseek_v4_resource_plan$(EXE) \
-	tests/test_deepseek_v4_prompt$(EXE)
-V4_TOOL_BINS = tools/probe_deepseek_v4_layers$(EXE) \
-	tools/probe_deepseek_v4_attention$(EXE) \
-	tools/probe_deepseek_v4_block$(EXE) \
-	tools/probe_deepseek_v4_compressor$(EXE) \
-	tools/probe_deepseek_v4_ratio4_compressor$(EXE) \
-	tools/probe_deepseek_v4_indexer$(EXE) \
-	tools/probe_deepseek_v4_attention_sequence$(EXE) \
-	tools/deepseek_v4_first_token$(EXE) \
-	tools/deepseek_v4_tokenizer$(EXE)
+	tests/test_tensor_io$(EXE) tests/test_deepseek_v4$(EXE)
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) \
 	tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) \
 	tests/test_decode_batch$(EXE) tests/test_idot$(EXE) \
@@ -428,6 +411,25 @@ tools/deepseek_v4_first_token$(EXE): tools/deepseek_v4_first_token.c tok.h tok_u
 		deepseek_v4_sparse_attention.c deepseek_v4_expert.c \
 		deepseek_v4_expert_store.c deepseek_v4_block.c $< \
 		-o $@ -pthread $(LDFLAGS)
+# Merged DeepSeek V4 unit tests — objects from amalgamated units (test-only + deps).
+include Makefile.deepseek-v4.units
+V4_TEST_LINK_OBJS = \
+	COLI_V4_UNIT_MATH.o \
+	COLI_V4_UNIT_SPARSE_ATTENTION.o \
+	COLI_V4_UNIT_RESOURCE_PLAN.o \
+	COLI_V4_UNIT_PROMPT.o \
+	$(addsuffix .o,$(V4_TEST_UNITS)) \
+	safetensors_index.o native_quant.o
+
+tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h \
+		deepseek_v4_dspark.h Makefile.deepseek-v4.units
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
+		COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
+		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o \
+		safetensors_index.o
+	$(CC) $(CFLAGS) native_quant.c -c -o native_quant.o
+	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
+
 test-c: $(TEST_BINS)
 	$(PYTHON) tools/run_tests.py $(TEST_BINS)
 

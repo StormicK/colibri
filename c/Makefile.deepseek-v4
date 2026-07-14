@@ -36,39 +36,35 @@ LDFLAGS = -lm -fopenmp -pthread \
 V4_BINARY := deepseek_v4
 endif
 
-SOURCES = safetensors_index.c deepseek_v4_config_dspark_compat.c \
-	deepseek_v4_layer_resident.c deepseek_v4_resource_plan.c \
-	deepseek_v4_head_cache.c deepseek_v4_expert_store_auto.c \
-	deepseek_v4_math.c native_quant_parallel.c native_quant_dual.c \
-	tensor_io.c deepseek_v4_attention.c deepseek_v4_attention_batch.c \
-	deepseek_v4_compressor.c deepseek_v4_indexer.c \
-	deepseek_v4_sparse_attention.c deepseek_v4_block_hybrid.c \
-	deepseek_v4_dspark.c deepseek_v4_dspark_memory.c \
-	deepseek_v4_dspark_runtime_resident.c deepseek_v4_dspark_expert_store.c \
-	deepseek_v4_dspark_attention.c deepseek_v4_dspark_block.c \
-	deepseek_v4_dspark_final.c deepseek_v4_dspark_runner.c \
-	deepseek_v4_compressor_snapshot.c deepseek_v4_indexer_snapshot.c \
-	deepseek_v4_attention_transaction.c deepseek_v4_target_head_batch.c \
-	deepseek_v4_speculative.c deepseek_v4_dspark_heads.c \
-	deepseek_v4_dspark_capture.c deepseek_v4_target_verify.c \
-	deepseek_v4_target_attention_commit.c native_quant_batch_avx512.c \
-	native_quant_fp4_rows16.c deepseek_v4_expert_store_hot_rows16.c \
-	deepseek_v4_expert_rows16.c tools/deepseek_v4_generate_stats.c \
-	deepseek_v4_route_bf16.c deepseek_v4_target_verify_prefix.c \
-	deepseek_v4_runtime.c deepseek_v4_prompt.c
+include Makefile.deepseek-v4.units
 
-SCHED_SOURCE = deepseek_v4_dspark_verify_window.c
+# native_quant.c / native_quant_batch.c are pulled in by the parallel/avx512 TUs.
+SHARED_SOURCES = safetensors_index.c native_quant_parallel.c \
+	native_quant_dual.c native_quant_batch_avx512.c \
+	native_quant_fp4_rows16.c tensor_io.c
 
-.PHONY: deepseek-v4 deepseek-v4-clean
+SHARED_OBJS = $(SHARED_SOURCES:.c=.o)
+TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
+DSPARK_OBJS = $(addsuffix .o,$(V4_DSPARK_UNITS))
+TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
+V4_OBJS = $(SHARED_OBJS) $(TARGET_OBJS) $(DSPARK_OBJS)
+
+.PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs
 deepseek-v4: $(V4_BINARY)
 
-$(V4_BINARY): $(SOURCES) $(SCHED_SOURCE) \
-	deepseek_v4_block.c deepseek_v4_block_pipeline.c \
-	deepseek_v4_block_batch.c deepseek_v4_expert_store.c \
-	native_quant.c native_quant_batch.c tok.h tok_unicode.h \
-	deepseek_v4_target_verify_prefix.h deepseek_v4_runtime.h \
-	deepseek_v4_prompt.h
-	$(CC) $(CFLAGS) $(SOURCES) $(SCHED_SOURCE) -o $@ $(LDFLAGS)
+$(V4_BINARY): $(V4_OBJS)
+	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
+
+$(SHARED_OBJS): %.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h deepseek_v4_dspark.h
+	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
+
+$(DSPARK_OBJS): %.o: deepseek_v4_dspark.c deepseek_v4.h deepseek_v4_dspark.h
+	$(CC) $(CFLAGS) -D$* -c deepseek_v4_dspark.c -o $@
+
+deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 
 deepseek-v4-clean:
-	rm -f deepseek_v4 deepseek_v4.exe
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS)

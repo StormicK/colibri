@@ -35,6 +35,12 @@ c/tests/test_schema_gbnf
 c/tests/test_schema_gbnf.exe
 c/tests/test_compat_direct
 c/tests/test_compat_direct.exe
+c/tests/test_i4_acc512
+c/tests/test_i4_acc512.exe
+c/tests/test_deepseek_v4
+c/tests/test_deepseek_v4.exe
+c/deepseek_v4
+c/deepseek_v4.exe
 
 # oracoli tiny generati (make_glm_oracle.py) e dati benchmark scaricati
 c/glm_tiny/
