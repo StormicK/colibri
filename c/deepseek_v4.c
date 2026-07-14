@@ -6320,6 +6320,7 @@ typedef struct {
     const char *model_dir;
     const char *draft_model_dir;
     const char *prompt;
+    const char *prompt_file;
     const char *system_prompt;
     const char *oracle_path;
     const char *record_oracle_path;
@@ -6335,9 +6336,11 @@ typedef struct {
 static void v4_cli_usage(FILE *stream, const char *program) {
     fprintf(stream,
         "usage: %s MODEL PROMPT [options]\n"
+        "       %s MODEL --prompt-file FILE [options]\n"
         "       %s MODEL --oracle FILE [--teacher-forcing N] [--greedy N] [options]\n"
         "  --max-tokens N       maximum generated tokens (default: 128)\n"
         "  --memory-gb GiB      cap this process; otherwise use available RAM\n"
+        "  --prompt-file PATH   read UTF-8 prompt from file (avoids argv encoding issues)\n"
         "  --draft-model PATH   separate DSpark checkpoint (default: MODEL)\n"
         "  --system TEXT        optional system message\n"
         "  --thinking           enable the official V4 thinking prefix\n"
@@ -6348,7 +6351,43 @@ static void v4_cli_usage(FILE *stream, const char *program) {
         "  --teacher-forcing N  oracle: compare top-1 on N prompt positions\n"
         "  --greedy N           oracle: compare N greedy continuation tokens\n"
         "  --record-oracle FILE write greedy tokens + tf_pred to JSON\n",
-        program, program);
+        program, program, program);
+}
+
+static char *v4_read_prompt_file(const char *path, char *error, size_t error_size) {
+    FILE *stream = fopen(path, "rb");
+    if (!stream) {
+        snprintf(error, error_size, "cannot open prompt file: %s", path);
+        return NULL;
+    }
+    if (fseek(stream, 0, SEEK_END)) {
+        fclose(stream);
+        snprintf(error, error_size, "cannot seek prompt file: %s", path);
+        return NULL;
+    }
+    long length = ftell(stream);
+    if (length < 0 || fseek(stream, 0, SEEK_SET)) {
+        fclose(stream);
+        snprintf(error, error_size, "cannot size prompt file: %s", path);
+        return NULL;
+    }
+    char *text = malloc((size_t)length + 1);
+    if (!text) {
+        fclose(stream);
+        snprintf(error, error_size, "out of memory reading prompt file");
+        return NULL;
+    }
+    size_t read = fread(text, 1, (size_t)length, stream);
+    fclose(stream);
+    if (read != (size_t)length) {
+        free(text);
+        snprintf(error, error_size, "cannot read prompt file: %s", path);
+        return NULL;
+    }
+    while (read > 0 && (text[read - 1] == '\n' || text[read - 1] == '\r'))
+        read--;
+    text[read] = 0;
+    return text;
 }
 
 static int v4_cli_positive_int(const char *text, int *output) {
@@ -6390,6 +6429,9 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
         } else if (!strcmp(option, "--memory-gb")) {
             if (++i == argc || v4_cli_memory(argv[i], &options->memory_gib))
                 return -1;
+        } else if (!strcmp(option, "--prompt-file")) {
+            if (++i == argc || !argv[i][0]) return -1;
+            options->prompt_file = argv[i];
         } else if (!strcmp(option, "--draft-model")) {
             if (++i == argc || !argv[i][0]) return -1;
             options->draft_model_dir = argv[i];
@@ -6425,10 +6467,13 @@ static int v4_cli_parse(int argc, char **argv, V4CliOptions *options) {
         }
     }
     if (options->oracle_path) {
-        if (options->prompt || options->record_oracle_path) return -1;
+        if (options->prompt || options->prompt_file ||
+            options->record_oracle_path) return -1;
         if (!options->teacher_forcing) options->teacher_forcing = 32;
         if (!options->greedy) options->greedy = 20;
         options->no_dspark = 1;
+    } else if (options->prompt_file) {
+        if (options->prompt) return -1;
     } else if (!options->prompt) {
         return -1;
     }
@@ -6622,6 +6667,15 @@ int main(int argc, char **argv) {
             (uint64_t)(cli.memory_gib * 1073741824.0);
 
     char error[512] = {0}, tokenizer_path[4096];
+    char *prompt_storage = NULL;
+    if (cli.prompt_file) {
+        prompt_storage = v4_read_prompt_file(cli.prompt_file, error, sizeof(error));
+        if (!prompt_storage) {
+            fprintf(stderr, "%s\n", error);
+            return 1;
+        }
+        cli.prompt = prompt_storage;
+    }
     ColiDeepSeekV4Config config; ColiSafetensorsIndex *index = NULL;
     ColiExpertStore *experts = NULL; ColiV4DSparkRunner *runner = NULL;
     if (coli_v4_config_load(&config, cli.model_dir, error, sizeof(error)) ||
@@ -6630,6 +6684,7 @@ int main(int argc, char **argv) {
             &(ColiDeepSeekV4ExpertStoreOptions){cli.model_dir,
                 config.num_hidden_layers, config.n_routed_experts, 4ULL << 30},
             &experts, error, sizeof(error))) {
+        free(prompt_storage);
         fprintf(stderr, "%s\n", error); return 1;
     }
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",

@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import argparse
 import subprocess
 import sys
 import tempfile
@@ -77,6 +78,22 @@ class V4CliTest(unittest.TestCase):
             "RAM 23.95/24.00 GiB | TTFT 15.50s | prefill 1.250 tok/s | "
             "decode 1.000 tok/s | DSpark acceptance 50.0%",
         )
+
+    def test_engine_command_prefers_prompt_file(self):
+        cli = load_cli()
+        args = argparse.Namespace(model=str(HERE), ngen=32, ram=0, stop_sentence=False)
+        command = cli.engine_command(args, raw=True, prompt_file=r"C:\tmp\prompt.txt")
+        self.assertIn("--prompt-file", command)
+        self.assertIn(r"C:\tmp\prompt.txt", command)
+        self.assertNotIn("你好", command)
+
+    def test_write_prompt_file_is_utf8(self):
+        cli = load_cli()
+        path = cli.write_prompt_file("你好")
+        try:
+            self.assertEqual(Path(path).read_text(encoding="utf-8"), "你好")
+        finally:
+            Path(path).unlink(missing_ok=True)
 
 if __name__ == "__main__":
     unittest.main()

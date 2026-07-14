@@ -20,6 +20,30 @@ ASSISTANT = "<\uff5cAssistant\uff5c>"
 EOS = "<\uff5cend\u2581of\u2581sentence\uff5c>"
 
 
+def configure_stdio_utf8():
+    """Make PowerShell / Windows consoles accept Chinese input and output."""
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    os.environ.setdefault("PYTHONUTF8", "1")
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        except (AttributeError, OSError):
+            pass
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def positive_int(text):
     value = int(text)
     if value < 1:
@@ -76,14 +100,15 @@ def completed_history(prompt, answer):
     return prompt + answer + EOS
 
 
-def engine_command(args, prompt, raw=True):
-    command = [
-        ENGINE,
-        os.path.abspath(args.model),
-        prompt,
-        "--max-tokens",
-        str(args.ngen),
-    ]
+def engine_command(args, prompt=None, raw=True, prompt_file=None):
+    command = [ENGINE, os.path.abspath(args.model)]
+    if prompt_file:
+        command.extend(("--prompt-file", prompt_file))
+    elif prompt is not None:
+        command.append(prompt)
+    else:
+        raise ValueError("prompt or prompt_file is required")
+    command.extend(("--max-tokens", str(args.ngen)))
     if raw:
         command.append("--raw-prompt")
     if args.ram:
@@ -91,6 +116,22 @@ def engine_command(args, prompt, raw=True):
     if getattr(args, "stop_sentence", False):
         command.append("--stop-sentence")
     return command
+
+
+def write_prompt_file(prompt):
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".txt",
+        delete=False,
+        newline="\n",
+    )
+    try:
+        handle.write(prompt)
+        handle.flush()
+        return handle.name
+    finally:
+        handle.close()
 
 
 def compact_stats(log):
@@ -117,28 +158,58 @@ def compact_stats(log):
         fields.append(f"DSpark acceptance {100.0 * float(summary.group(3)):.1f}%")
     return " | ".join(fields)
 
+
+def emit_text(text):
+    """Write Unicode text through the UTF-8 text stream when possible."""
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        return
+    except UnicodeEncodeError:
+        pass
+    sys.stdout.buffer.write(text.encode("utf-8", errors="replace"))
+    sys.stdout.buffer.flush()
+
+
+def emit_bytes(chunk):
+    """Stream engine UTF-8 bytes; decode via text stdout after UTF-8 setup."""
+    try:
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+    except (AttributeError, OSError, ValueError):
+        emit_text(chunk.decode("utf-8", errors="replace"))
+
+
 def generate(args, prompt, raw=True, stream=True):
     validate_model(args.model)
     validate_engine()
-    with tempfile.TemporaryFile(mode="w+b") as error_log:
-        process = subprocess.Popen(
-            engine_command(args, prompt, raw),
-            stdout=subprocess.PIPE,
-            stderr=error_log,
-            bufsize=0,
-        )
-        chunks = []
-        while True:
-            chunk = process.stdout.read(256)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            if stream:
-                sys.stdout.buffer.write(chunk)
-                sys.stdout.buffer.flush()
-        return_code = process.wait()
-        error_log.seek(0)
-        diagnostics = error_log.read().decode("utf-8", errors="replace")
+    # Always pass the prompt through a UTF-8 file. Windows argv uses the ANSI
+    # code page for MinGW main(), which corrupts Chinese from PowerShell.
+    prompt_path = write_prompt_file(prompt)
+    try:
+        with tempfile.TemporaryFile(mode="w+b") as error_log:
+            process = subprocess.Popen(
+                engine_command(args, raw=raw, prompt_file=prompt_path),
+                stdout=subprocess.PIPE,
+                stderr=error_log,
+                bufsize=0,
+            )
+            chunks = []
+            while True:
+                chunk = process.stdout.read(256)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if stream:
+                    emit_bytes(chunk)
+            return_code = process.wait()
+            error_log.seek(0)
+            diagnostics = error_log.read().decode("utf-8", errors="replace")
+    finally:
+        try:
+            os.unlink(prompt_path)
+        except OSError:
+            pass
     answer = b"".join(chunks).decode("utf-8", errors="replace").rstrip("\r\n")
     if return_code:
         tail = "\n".join(diagnostics.rstrip().splitlines()[-12:])
@@ -219,6 +290,7 @@ def make_parser():
 
 
 def main():
+    configure_stdio_utf8()
     args = make_parser().parse_args()
     return args.handler(args)
 
