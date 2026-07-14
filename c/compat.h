@@ -84,6 +84,7 @@ static inline int compat_open_direct(const char *path){
 #include <malloc.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <stdio.h>
 
 /* --- O_BINARY: belt-and-braces vs CRT text-mode (0x0A byte corruption) --- */
 #ifndef O_BINARY
@@ -94,6 +95,7 @@ static inline int compat_open_direct(const char *path){
  * is defense-in-depth: if anyone adds a future CRT-based read path, O_BINARY
  * prevents 0x0A bytes from being silently translated to \r\n. */
 #define COMPAT_O_RDONLY (O_RDONLY | O_BINARY)
+#define COMPAT_O_BINARY O_BINARY
 
 /* --- posix_fadvise: Windows has no direct equivalent. Semantics:
  *      WILLNEED  -> warm the OS page cache so a later synchronous pread finds the
@@ -237,7 +239,9 @@ static inline int compat_rename(const char *old, const char *new){
 /* --- rss_gb: getrusage -> GetProcessMemoryInfo ---
  * ru_maxrss in KB (come Linux): rss_gb() divide per 1e6 → GB corretti. */
 #include <psapi.h>
+#ifdef _MSC_VER
 #pragma comment(lib, "psapi.lib")
+#endif
 struct rusage { long ru_maxrss; };
 #define RUSAGE_SELF 0
 static inline int getrusage(int who, struct rusage *r){
@@ -315,6 +319,9 @@ static inline int compat_setenv(const char *name, const char *value, int overwri
 /* --- COMPAT_O_RDONLY: O_RDONLY con O_BINARY su Windows, O_RDONLY puro altrove --- */
 #ifndef COMPAT_O_RDONLY
 #define COMPAT_O_RDONLY O_RDONLY
+#endif
+#ifndef COMPAT_O_BINARY
+#define COMPAT_O_BINARY 0
 #endif
 
 #endif /* COMPAT_H */

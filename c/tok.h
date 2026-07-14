@@ -1,6 +1,6 @@
 /* Tokenizer GLM-5.2 in C puro (byte-level BPE stile cl100k / tiktoken).
  * Replica fedele di tokenizer.json:
- *   - model.type = BPE, ignore_merges=true, byte_fallback=false
+ *   - model.type = BPE, byte_fallback=false
  *   - pre_tokenizer: regex Split (pattern cl100k) + ByteLevel(add_prefix_space=false)
  *   - merges con rank = ordine nella lista; \p{L}/\p{N}/\s da tok_unicode.h
  *   - added_tokens (speciali e non) trattati come atomici in encode/decode
@@ -115,13 +115,21 @@ static void tok_load(Tok *T, const char *path){
         hm_put(&T->vocab, k, (int)strlen(k), id);
         T->id2str[id]=(char*)k;
     }
-    /* merges: "left\0right" -> rank=i */
+    /* merges: HF accepts either [left,right] pairs or "left right" strings.
+     * Internally both become "left\0right" -> rank=i. */
     int mc=1; while(mc < merges->len*2) mc<<=1;
     hm_init(&T->merges, mc);
     for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
-        const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
-        int ll=(int)strlen(l), rl=(int)strlen(r);
+        const char *l=NULL, *r=NULL; int ll=0, rl=0;
+        if(pr->t==J_ARR && pr->len==2 && pr->kids[0]->t==J_STR && pr->kids[1]->t==J_STR){
+            l=pr->kids[0]->str; r=pr->kids[1]->str;
+            ll=(int)strlen(l); rl=(int)strlen(r);
+        }else if(pr->t==J_STR){
+            const char *separator=strchr(pr->str,' ');
+            if(!separator) continue;
+            l=pr->str; ll=(int)(separator-l); r=separator+1; rl=(int)strlen(r);
+        }else continue;
         char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
         hm_put(&T->merges, key, ll+1+rl, i);
     }
