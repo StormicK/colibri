@@ -11,10 +11,12 @@ static int dual_same_shape(const ColiTensorView *a, const ColiTensorView *b) {
            a->block_columns == b->block_columns;
 }
 
-int coli_fp4_dual_matvec_ref(float *output_a, float *output_b,
-                             const ColiTensorView *a,
-                             const ColiTensorView *b,
-                             const float *input) {
+/* Exported as the float fallback; coli_fp4_dual_matvec_ref itself now lives
+ * in native_quant_avx2.c (int8 dot), which includes this file. */
+int coli_fp4_dual_matvec_float_ref(float *output_a, float *output_b,
+                                   const ColiTensorView *a,
+                                   const ColiTensorView *b,
+                                   const float *input) {
     if (!output_a || !output_b || !input || !dual_same_shape(a, b) ||
         a->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
         b->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||

@@ -17,8 +17,10 @@ static void build_decode_tables_v4(float fp4[16], float fp8[256],
     }
 }
 
-int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
-                        const float *input) {
+/* Exported as the float fallback; coli_fp4_matvec_ref itself now lives in
+ * native_quant_avx2.c (int8 dot), which includes this file. */
+int coli_fp4_matvec_float_ref(float *output, const ColiTensorView *weight,
+                              const float *input) {
     if (!output || !weight || !input ||
         weight->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
         weight->scale_format != COLI_SCALE_UE8M0 ||

@@ -51,9 +51,10 @@ endif
 
 include Makefile.deepseek-v4.units
 
-# native_quant.c / native_quant_batch.c are pulled in by the parallel/avx512 TUs.
-SHARED_SOURCES = safetensors_index.c native_quant_parallel.c \
-	native_quant_dual.c native_quant_batch_avx512.c \
+# native_quant.c / native_quant_parallel.c / native_quant_dual.c /
+# native_quant_batch.c are pulled in by the avx2/avx512 TUs.
+SHARED_SOURCES = safetensors_index.c native_quant_avx2.c \
+	native_quant_batch_avx512.c \
 	native_quant_fp4_rows16.c tensor_io.c
 
 SHARED_OBJS = $(SHARED_SOURCES:.c=.o)
