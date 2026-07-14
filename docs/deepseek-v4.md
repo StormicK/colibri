@@ -22,7 +22,10 @@ tiering—end-to-end generation that passes smoke tests.
   `make deepseek-v4` builds `c/deepseek_v4.exe`.
 - **CLI**: `c/v4` (Python launcher, stdlib only) wraps `run` / `chat`; inference
   itself is engine + session (`coli_v4_engine_open` → `coli_v4_session_create` /
-  `generate` → `destroy`).
+  `generate` → destroy sessions, then engine). The engine/session surface in
+  `deepseek_v4.h` is an **experimental** public API and may change. Engine copies
+  model directory strings; destroy every session before `coli_v4_engine_destroy`.
+  Index and ExpertStore accessors stay internal (`deepseek_v4_internal.h`).
 
 ## Model snapshot
 

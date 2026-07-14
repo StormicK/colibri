@@ -610,8 +610,11 @@ struct ColiV4Engine {
         const ColiSafetensorsIndex *index;
         uint64_t total_bytes;
     } dspark_resident;
+    char *owned_target_model_dir;
+    char *owned_dspark_model_dir;
     int owns_experts;
     int owns_index;
+    int active_sessions; /* sessions created against this engine */
 };
 
 /* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap). */
@@ -622,9 +625,38 @@ int coli_v4_expert_store_open_planned(
     char *error,
     size_t error_size);
 
+/* Internal accessors — not part of the experimental public API. */
+ColiSafetensorsIndex *coli_v4_engine_target_index(ColiV4Engine *engine);
+ColiExpertStore *coli_v4_engine_expert_store(ColiV4Engine *engine);
+
 /* Head-cache aware safetensors read (engine NULL => plain coli_st_read_at). */
 int coli_st_read_at_engine(ColiV4Engine *engine,
                            const ColiSafetensorsIndex *index, int shard,
                            uint64_t offset, size_t length, void *destination);
+
+/*
+ * Unit-test hooks (default 0). Production callers must leave these untouched.
+ * Defined in deepseek_v4.c / deepseek_v4_dspark.c.
+ */
+extern int coli_v4_test_fail_expert_store_open;
+extern int coli_v4_test_skip_expert_store_open;
+extern int coli_v4_test_closed_owned_index;
+extern int coli_v4_test_runner_close_count;
+extern int coli_v4_test_fail_shared_heads;
+
+typedef struct ColiV4DSparkRunner ColiV4DSparkRunner;
+
+/* Lightweight session shell mirroring engine/session ownership for unit tests. */
+typedef struct ColiV4TestSession {
+    ColiV4Engine *engine;
+    ColiV4DSparkRunner *runner;
+} ColiV4TestSession;
+
+int coli_v4_test_session_shell_create(ColiV4TestSession **session,
+                                      ColiV4Engine *engine);
+void coli_v4_test_session_shell_destroy(ColiV4TestSession *session);
+/* Assign runner then fail shared-head bind (session_generate ownership order). */
+int coli_v4_test_session_shell_bind_runner_fail_shared(
+    ColiV4TestSession *session);
 
 #endif /* COLIBRI_DEEPSEEK_V4_INTERNAL_H */

@@ -49,9 +49,10 @@ typedef struct {
  * - release() clears the entire view. release() on an already-cleared or
  *   zero-initialized view is a no-op.
  * - destroy() requires zero active leases (debug builds assert).
- * - lookup/release/prefetch/stats/destroy are thread-safe with respect to the
- *   same store (serialized by the implementation). Views must not be used
- *   concurrently from multiple threads.
+ * - Thread-safety is implementation-specific. Callers must not assume that
+ *   lookup/release/prefetch/stats/destroy are safe to call concurrently on
+ *   the same store unless the concrete store documents that guarantee.
+ *   Views must not be used concurrently from multiple threads.
  * - prefetch() is advisory, holds no lease, and must not evict a slot that
  *   still has an active lease.
  */

@@ -179,7 +179,7 @@ ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
-TEST_BINS += tests/test_deepseek_v4$(EXE)
+TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE)
 endif
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
@@ -468,6 +468,14 @@ tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4
 		safetensors_index.o
 	$(CC) $(CFLAGS) native_quant.c -c -o native_quant.o
 	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
+
+# Engine/session ownership regressions (RUNTIME + CONFIG only).
+V4_OWNERSHIP_OBJS = COLI_V4_UNIT_RUNTIME.o COLI_V4_UNIT_CONFIG.o safetensors_index.o
+tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c deepseek_v4.c deepseek_v4.h \
+		deepseek_v4_internal.h
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) \
+		COLI_V4_UNIT_RUNTIME.o COLI_V4_UNIT_CONFIG.o safetensors_index.o
+	$(CC) $(CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
 endif
 
 test-c: $(TEST_BINS)

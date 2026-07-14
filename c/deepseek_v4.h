@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-/* ---- config (stable) ---- */
+/* ---- config ---- */
 
 #define COLI_V4_MAX_LAYERS 128
 
@@ -54,7 +54,7 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
 int coli_v4_config_load(ColiDeepSeekV4Config *config, const char *model_dir,
                         char *error, size_t error_size);
 
-/* ---- prompt (stable) ---- */
+/* ---- prompt ---- */
 
 typedef enum {
     COLI_V4_PROMPT_CHAT,
@@ -66,13 +66,16 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
                          const char *user_message, const char *system_message,
                          ColiDeepSeekV4PromptMode mode);
 
-/* ---- engine (stable long-term API) ---- */
+/* ---- experimental public engine API ---- */
+/*
+ * The API is scoped to the DeepSeek V4 engine and may change while
+ * the implementation remains experimental.
+ */
 
 typedef struct ColiV4Engine ColiV4Engine;
-typedef struct ColiExpertStore ColiExpertStore;
-typedef struct ColiSafetensorsIndex ColiSafetensorsIndex;
 
 typedef struct {
+    /* Copied by coli_v4_engine_open; caller strings need not outlive the engine. */
     const char *target_model_dir;   /* required */
     const char *dspark_model_dir;   /* NULL => same as target */
     uint64_t memory_limit_bytes;    /* 0 => use OS available memory */
@@ -94,18 +97,20 @@ typedef struct {
 int coli_v4_engine_open(ColiV4Engine **engine,
                         const ColiV4EngineOpenOptions *options,
                         char *error, size_t error_size);
+/* Undefined if any ColiV4Session created from this engine is still alive.
+ * Destroy every session before destroying the engine. */
 void coli_v4_engine_destroy(ColiV4Engine *engine);
 
 const ColiDeepSeekV4Config *coli_v4_engine_config(const ColiV4Engine *engine);
-ColiSafetensorsIndex *coli_v4_engine_target_index(ColiV4Engine *engine);
-ColiExpertStore *coli_v4_engine_expert_store(ColiV4Engine *engine);
 void coli_v4_engine_memory_summary(const ColiV4Engine *engine,
                                    ColiV4EngineMemorySummary *summary);
 
 const char *coli_v4_engine_target_model_dir(const ColiV4Engine *engine);
 const char *coli_v4_engine_dspark_model_dir(const ColiV4Engine *engine);
 
-/* ---- session (stable) ---- */
+/* ---- experimental public session API ----
+ * Session borrows the engine; destroy all sessions before coli_v4_engine_destroy.
+ */
 
 typedef struct ColiV4Session ColiV4Session;
 

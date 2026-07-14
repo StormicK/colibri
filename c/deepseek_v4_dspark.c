@@ -2246,6 +2246,9 @@ uint64_t coli_v4_dspark_runner_loaded_stage_peak(
 
 #include "deepseek_v4_dspark.h"
 
+int coli_v4_test_fail_shared_heads = 0;
+extern int coli_v4_test_runner_close_count;
+
 int coli_v4_dspark_runner_open(ColiV4DSparkRunner **output,
                                ColiV4Engine *engine,
                                const char *dspark_model_dir,
@@ -2264,6 +2267,7 @@ int coli_v4_dspark_runner_open(ColiV4DSparkRunner **output,
 
 int coli_v4_dspark_runner_use_shared_heads(ColiV4DSparkRunner *runner,
                                            ColiV4DSparkHeads *heads) {
+    if (coli_v4_test_fail_shared_heads) return -1;
     if (!runner || !heads) return -1;
     coli_v4_dspark_heads_close(runner->heads);
     runner->heads = heads;
@@ -2271,6 +2275,7 @@ int coli_v4_dspark_runner_use_shared_heads(ColiV4DSparkRunner *runner,
 }
 
 void coli_v4_dspark_runner_close(ColiV4DSparkRunner *runner) {
+    if (runner) coli_v4_test_runner_close_count++;
     if (runner && runner->engine &&
         runner->heads == runner->engine->dspark_capture.heads)
         runner->heads = NULL;
