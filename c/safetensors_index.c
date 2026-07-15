@@ -84,6 +84,28 @@ static int dtype_from_name(const char *name, ColiSafetensorsDType *dtype) {
     return -1;
 }
 
+static int dtype_width(ColiSafetensorsDType dtype, uint64_t *width) {
+    switch (dtype) {
+        case COLI_ST_U8:
+        case COLI_ST_I8:
+        case COLI_ST_F8_E4M3:
+        case COLI_ST_F8_E8M0:
+            *width = 1;
+            return 0;
+        case COLI_ST_BF16:
+        case COLI_ST_F16:
+            *width = 2;
+            return 0;
+        case COLI_ST_F32:
+            *width = 4;
+            return 0;
+        case COLI_ST_I64:
+            *width = 8;
+            return 0;
+    }
+    return -1;
+}
+
 const char *coli_st_dtype_name(ColiSafetensorsDType dtype) {
     switch (dtype) {
         case COLI_ST_BF16: return "BF16";
@@ -223,6 +245,16 @@ static int index_shard(ColiSafetensorsIndex *index, const char *path,
             }
             tensor.shape[dimension] = (int64_t)extent;
             tensor.numel *= extent;
+        }
+
+        uint64_t width = 0;
+        if (dtype_width(tensor.dtype, &width) != 0 ||
+            tensor.numel > UINT64_MAX / width ||
+            end - start != tensor.numel * width) {
+            result = set_error(error, error_size,
+                               "tensor byte size does not match dtype and shape: %s in %s",
+                               name, path);
+            goto cleanup;
         }
 
         tensor.name = strdup(name);

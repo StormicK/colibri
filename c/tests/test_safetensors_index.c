@@ -107,6 +107,7 @@ int main(void) {
         "\"data_offsets\":[6,8]}}";
     static const unsigned char valid_payload[] = {1, 2, 3, 4, 5, 6, 7, 8};
     static const unsigned char one_byte[] = {0};
+    static const unsigned char mismatch_payload[4096] = {0};
     static const struct {
         const char *label;
         const char *header;
@@ -160,6 +161,32 @@ int main(void) {
     for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
         if (write_fixture(path, malformed[i].header, one_byte, sizeof(one_byte)) != 0 ||
             expect_rejected(directory, malformed[i].label) != 0)
+            failures++;
+    }
+
+    static const struct {
+        const char *label;
+        const char *header;
+        size_t payload_size;
+    } size_mismatches[] = {
+        {"f32-byte-size-mismatch",
+         "{\"w\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4096]}}",
+         4096},
+        {"bf16-byte-size-mismatch",
+         "{\"w\":{\"dtype\":\"BF16\",\"shape\":[4096],\"data_offsets\":[0,2]}}",
+         2},
+        {"i64-byte-size-mismatch",
+         "{\"w\":{\"dtype\":\"I64\",\"shape\":[1],\"data_offsets\":[0,4]}}",
+         4},
+        {"fp8-byte-size-mismatch",
+         "{\"w\":{\"dtype\":\"F8_E4M3\",\"shape\":[2],\"data_offsets\":[0,1]}}",
+         1},
+    };
+    for (size_t i = 0;
+         i < sizeof(size_mismatches) / sizeof(size_mismatches[0]); i++) {
+        if (write_fixture(path, size_mismatches[i].header, mismatch_payload,
+                          size_mismatches[i].payload_size) != 0 ||
+            expect_rejected(directory, size_mismatches[i].label) != 0)
             failures++;
     }
 

@@ -247,32 +247,31 @@ int coli_v4_layer_load(ColiV4Engine *engine,
                        const ColiDeepSeekV4Config *config,
                        const ColiSafetensorsIndex *index, int layer,
                        char *error, size_t error_size) {
+    const ColiDeepSeekV4Config *effective_config =
+        engine ? &engine->config : config;
+    if (!weights || !effective_config || !index || layer < 0 ||
+        layer >= effective_config->num_hidden_layers ||
+        layer >= COLI_V4_RESIDENT_MAX_LAYERS_V2) return -1;
     if (!resident_enabled_v2(engine))
         return coli_v4_layer_resident_reference_load(
-            NULL, weights, config, index, layer, error, error_size);
-    if (!engine || !weights || !config || !index || layer < 0 ||
-        layer >= config->num_hidden_layers ||
-        layer >= COLI_V4_RESIDENT_MAX_LAYERS_V2) return -1;
-    /* Configs are copied into sessions and CLI validation contexts. The shard
-     * index, not the address of an equivalent config copy, identifies a model. */
+            NULL, weights, effective_config, index, layer, error, error_size);
     if (engine->dense_resident.index && engine->dense_resident.index != index) {
         if (error && error_size)
             snprintf(error, error_size,
                      "resident V4 dense cache cannot switch model instances");
         return -1;
     }
-    engine->dense_resident.config = config;
     engine->dense_resident.index = index;
     if (!engine->dense_resident.ready[layer]) {
         if (coli_v4_layer_resident_reference_load(
-                NULL, &engine->dense_resident.layers[layer], config, index,
+                NULL, &engine->dense_resident.layers[layer], effective_config, index,
                 layer, error, error_size)) return -1;
         engine->dense_resident.ready[layer] = 1;
         engine->dense_resident.total_bytes +=
             engine->dense_resident.layers[layer].stats.total_bytes;
-        if (layer == config->num_hidden_layers - 1)
+        if (layer == effective_config->num_hidden_layers - 1)
             fprintf(stderr, "v4_dense_resident layers=%d bytes=%.3fGiB\n",
-                    config->num_hidden_layers,
+                    effective_config->num_hidden_layers,
                     engine->dense_resident.total_bytes / 1073741824.0);
     }
     *weights = engine->dense_resident.layers[layer]; return 0;
@@ -5716,7 +5715,6 @@ void coli_v4_engine_destroy(ColiV4Engine *engine) {
             NULL, &engine->dense_resident.layers[layer]);
         engine->dense_resident.ready[layer] = 0;
     }
-    engine->dense_resident.config = NULL;
     engine->dense_resident.index = NULL;
     engine->dense_resident.total_bytes = 0;
 
@@ -8472,6 +8470,9 @@ const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
 /* ######## deepseek_v4_config.c ######## */
 #include "deepseek_v4_internal.h"
 
+#include <float.h>
+#include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8489,20 +8490,28 @@ static int set_error(char *error, size_t size, const char *format, ...) {
     return -1;
 }
 
+static int json_int_value(const jval *value, int *output) {
+    if (!value || value->t != J_NUM || !isfinite(value->num) ||
+        floor(value->num) != value->num ||
+        value->num < (double)INT_MIN || value->num > (double)INT_MAX)
+        return -1;
+    *output = (int)value->num;
+    return 0;
+}
+
 static int required_int(jval *root, const char *name, int *output,
                         char *error, size_t error_size) {
-    jval *value = json_get(root, name);
-    if (!value || value->t != J_NUM)
-        return set_error(error, error_size, "missing integer config field: %s", name);
-    *output = (int)value->num;
+    if (json_int_value(json_get(root, name), output) != 0)
+        return set_error(error, error_size, "invalid integer config field: %s", name);
     return 0;
 }
 
 static int required_float(jval *root, const char *name, float *output,
                           char *error, size_t error_size) {
     jval *value = json_get(root, name);
-    if (!value || value->t != J_NUM)
-        return set_error(error, error_size, "missing numeric config field: %s", name);
+    if (!value || value->t != J_NUM || !isfinite(value->num) ||
+        fabs(value->num) > (double)FLT_MAX)
+        return set_error(error, error_size, "invalid numeric config field: %s", name);
     *output = (float)value->num;
     return 0;
 }
@@ -8586,12 +8595,12 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
     }
     config->compress_ratio_count = ratios->len;
     for (int index = 0; index < ratios->len; index++) {
-        if (ratios->kids[index]->t != J_NUM) {
+        if (json_int_value(ratios->kids[index],
+                           &config->compress_ratios[index]) != 0) {
             json_free(root);
             free(arena);
-            return set_error(error, error_size, "non-numeric compress ratio");
+            return set_error(error, error_size, "invalid compress ratio");
         }
-        config->compress_ratios[index] = (int)ratios->kids[index]->num;
     }
     jval *quantization = json_get(root, "quantization_config");
     if (!quantization || quantization->t != J_OBJ ||

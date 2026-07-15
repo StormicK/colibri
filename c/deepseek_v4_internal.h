@@ -600,7 +600,6 @@ struct ColiV4Engine {
     struct {
         ColiDeepSeekV4LayerWeights layers[COLI_V4_RESIDENT_MAX_LAYERS];
         unsigned char ready[COLI_V4_RESIDENT_MAX_LAYERS];
-        const ColiDeepSeekV4Config *config;
         const ColiSafetensorsIndex *index;
         uint64_t total_bytes;
     } dense_resident;

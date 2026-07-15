@@ -47,6 +47,33 @@ static int test_attention_cache(void) {
 /* ==== begin test_deepseek_v4_config.c ==== */
 /* umbrella headers */
 /* <stdio.h> */
+static int expect_config_rejected(const char *base, const char *needle,
+                                  const char *replacement, const char *label) {
+    const char *match = strstr(base, needle);
+    if (!match) {
+        fprintf(stderr, "%s: test replacement target not found\n", label);
+        return 1;
+    }
+    size_t prefix = (size_t)(match - base);
+    const char *suffix = match + strlen(needle);
+    size_t length = prefix + strlen(replacement) + strlen(suffix) + 1;
+    char *mutated = malloc(length);
+    if (!mutated) return 1;
+    memcpy(mutated, base, prefix);
+    strcpy(mutated + prefix, replacement);
+    strcpy(mutated + prefix + strlen(replacement), suffix);
+    ColiDeepSeekV4Config config;
+    char error[256] = {0};
+    int accepted =
+        coli_v4_config_parse(&config, mutated, error, sizeof(error)) == 0;
+    free(mutated);
+    if (accepted) {
+        fprintf(stderr, "%s: malformed config was accepted\n", label);
+        return 1;
+    }
+    return 0;
+}
+
 static int test_config(int argc, char **argv) {
     static const char config_json[] =
         "{\"model_type\":\"deepseek_v4\",\"expert_dtype\":\"fp4\","
@@ -77,6 +104,33 @@ static int test_config(int argc, char **argv) {
         config.compress_ratio_count != 4 || config.compress_ratios[1] != 4 ||
         config.compress_ratios[2] != 128 || config.rope_factor != 4.0f)
         return 1;
+    static const struct {
+        const char *label;
+        const char *needle;
+        const char *replacement;
+    } malformed_numbers[] = {
+        {"integer-nan", "\"hidden_size\":128", "\"hidden_size\":NaN"},
+        {"integer-infinity", "\"hidden_size\":128", "\"hidden_size\":1e309"},
+        {"integer-fraction", "\"hidden_size\":128", "\"hidden_size\":1.5"},
+        {"integer-overflow", "\"hidden_size\":128", "\"hidden_size\":2147483648"},
+        {"integer-underflow", "\"hidden_size\":128", "\"hidden_size\":-2147483649"},
+        {"float-nan", "\"rms_norm_eps\":1e-6", "\"rms_norm_eps\":NaN"},
+        {"float-infinity", "\"rms_norm_eps\":1e-6", "\"rms_norm_eps\":1e309"},
+        {"float-overflow", "\"rms_norm_eps\":1e-6", "\"rms_norm_eps\":1e39"},
+        {"ratio-nan", "\"compress_ratios\":[0,4,128,0]",
+         "\"compress_ratios\":[0,NaN,128,0]"},
+        {"ratio-fraction", "\"compress_ratios\":[0,4,128,0]",
+         "\"compress_ratios\":[0,1.5,128,0]"},
+        {"ratio-overflow", "\"compress_ratios\":[0,4,128,0]",
+         "\"compress_ratios\":[0,2147483648,128,0]"},
+    };
+    for (size_t i = 0;
+         i < sizeof(malformed_numbers) / sizeof(malformed_numbers[0]); i++)
+        if (expect_config_rejected(
+                config_json, malformed_numbers[i].needle,
+                malformed_numbers[i].replacement,
+                malformed_numbers[i].label))
+            return 1;
     if (argc > 1) {
         if (coli_v4_config_load(&config, argv[1], error, sizeof(error)) != 0) {
             fprintf(stderr, "%s\n", error);

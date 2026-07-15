@@ -150,14 +150,19 @@ def validate(
 
     off = collect(True)
     on = collect(False)
-    off_ok = off[: len(want)] == want[: len(off)]
-    same = off[:greedy] == on[:greedy]
+    expected = want[:greedy]
+    off_ok = len(off) == len(expected) and off == expected
+    on_ok = len(on) == len(expected) and on == expected
+    same = off == on
+    all_ok = off_ok and on_ok and same
     print(
-        f"[oracle] DSpark on/off identity: {'OK' if same else 'FAIL'} "
-        f"(no_dspark vs fixture {'OK' if off_ok else 'FAIL'})",
+        f"[oracle] DSpark on/off identity: {'OK' if all_ok else 'FAIL'} "
+        f"(no_dspark vs fixture {'OK' if off_ok else 'FAIL'}, "
+        f"dspark vs fixture {'OK' if on_ok else 'FAIL'}, "
+        f"on/off equality {'OK' if same else 'FAIL'})",
         file=sys.stderr,
     )
-    return 0 if same and off_ok else 1
+    return 0 if all_ok else 1
 
 
 def main() -> int:
