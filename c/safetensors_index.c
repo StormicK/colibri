@@ -4,6 +4,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,7 @@
 #include "json.h"
 
 #define COLI_ST_MAX_SHARDS 512
+#define COLI_ST_MAX_HEADER (512ULL << 20)
 
 typedef struct {
     char *path;
@@ -109,41 +111,78 @@ static int append_tensor(ColiSafetensorsIndex *index,
     return 0;
 }
 
+static int json_nonnegative_integer(const jval *value, double upper_exclusive,
+                                    uint64_t *result) {
+    if (!value || value->t != J_NUM || !isfinite(value->num) ||
+        value->num < 0.0 || value->num >= upper_exclusive ||
+        floor(value->num) != value->num)
+        return -1;
+    *result = (uint64_t)value->num;
+    return 0;
+}
+
 static int index_shard(ColiSafetensorsIndex *index, const char *path,
                        char *error, size_t error_size) {
     struct stat status;
+    int result = -1;
+    int fd = -1;
+    char *header = NULL;
+    char *arena = NULL;
+    jval *root = NULL;
+
     if (index->shard_count >= COLI_ST_MAX_SHARDS)
         return set_error(error, error_size, "too many safetensors shards");
-    int fd = open(path, COMPAT_O_RDONLY);
-    if (fd < 0)
-        return set_error(error, error_size, "cannot open %s: %s", path, strerror(errno));
+
+    fd = open(path, COMPAT_O_RDONLY);
+    if (fd < 0) {
+        result = set_error(error, error_size, "cannot open %s: %s",
+                           path, strerror(errno));
+        goto cleanup;
+    }
     if (fstat(fd, &status) != 0) {
-        close(fd);
-        return set_error(error, error_size, "cannot stat %s: %s", path, strerror(errno));
+        result = set_error(error, error_size, "cannot stat %s: %s",
+                           path, strerror(errno));
+        goto cleanup;
     }
+    if (status.st_size < 8) {
+        result = set_error(error, error_size, "invalid safetensors header: %s", path);
+        goto cleanup;
+    }
+
+    uint64_t shard_size = (uint64_t)status.st_size;
     uint64_t header_length = 0;
-    if (pread(fd, &header_length, 8, 0) != 8 ||
-        header_length < 2 || header_length > (uint64_t)status.st_size - 8) {
-        close(fd);
-        return set_error(error, error_size, "invalid safetensors header: %s", path);
+    if (pread(fd, &header_length, 8, 0) != 8 || header_length < 2 ||
+        header_length > shard_size - 8 || header_length > COLI_ST_MAX_HEADER) {
+        result = set_error(error, error_size, "invalid safetensors header: %s", path);
+        goto cleanup;
     }
-    char *header = (char *)malloc((size_t)header_length + 1);
+
+    header = (char *)malloc((size_t)header_length + 1);
     if (!header) {
-        close(fd);
-        return set_error(error, error_size, "out of memory reading %s", path);
+        result = set_error(error, error_size, "out of memory reading %s", path);
+        goto cleanup;
     }
     if (pread(fd, header, (size_t)header_length, 8) != (ssize_t)header_length) {
-        free(header);
-        close(fd);
-        return set_error(error, error_size, "short safetensors header: %s", path);
+        result = set_error(error, error_size, "short safetensors header: %s", path);
+        goto cleanup;
     }
     header[header_length] = 0;
-    char *arena = NULL;
-    jval *root = json_parse(header, &arena);
+
+    root = json_parse(header, &arena);
+    if (!root || root->t != J_OBJ) {
+        result = set_error(error, error_size,
+                           "safetensors header is not an object: %s", path);
+        goto cleanup;
+    }
+
     int shard = (int)index->shard_count;
     uint64_t data_start = 8 + header_length;
     for (int i = 0; i < root->len; i++) {
         const char *name = root->keys[i];
+        if (!name) {
+            result = set_error(error, error_size, "invalid tensor name in %s", path);
+            goto cleanup;
+        }
         if (!strcmp(name, "__metadata__")) continue;
         jval *metadata = root->kids[i];
         jval *dtype_value = json_get(metadata, "dtype");
@@ -151,58 +190,74 @@ static int index_shard(ColiSafetensorsIndex *index, const char *path,
         jval *shape = json_get(metadata, "shape");
         ColiSafetensorsTensor tensor;
         memset(&tensor, 0, sizeof(tensor));
-        if (!dtype_value || !offsets || offsets->len != 2 || !shape ||
+        if (!metadata || metadata->t != J_OBJ ||
+            !dtype_value || dtype_value->t != J_STR || !dtype_value->str ||
+            !offsets || offsets->t != J_ARR || offsets->len != 2 ||
+            !shape || shape->t != J_ARR ||
             shape->len > COLI_ST_MAX_RANK ||
             dtype_from_name(dtype_value->str, &tensor.dtype) != 0) {
-            free(arena);
-            free(header);
-            close(fd);
-            return set_error(error, error_size, "unsupported tensor metadata: %s in %s",
-                             name, path);
+            result = set_error(error, error_size,
+                               "unsupported tensor metadata: %s in %s", name, path);
+            goto cleanup;
         }
-        uint64_t start = (uint64_t)offsets->kids[0]->num;
-        uint64_t end = (uint64_t)offsets->kids[1]->num;
-        if (start > end || data_start + end > (uint64_t)status.st_size) {
-            free(arena);
-            free(header);
-            close(fd);
-            return set_error(error, error_size, "invalid offsets for %s in %s", name, path);
+
+        uint64_t start = 0, end = 0;
+        if (json_nonnegative_integer(offsets->kids[0], ldexp(1.0, 64), &start) != 0 ||
+            json_nonnegative_integer(offsets->kids[1], ldexp(1.0, 64), &end) != 0 ||
+            start > end || end > shard_size - data_start) {
+            result = set_error(error, error_size,
+                               "invalid offsets for %s in %s", name, path);
+            goto cleanup;
         }
+
+        tensor.rank = shape->len;
+        tensor.numel = 1;
+        for (int dimension = 0; dimension < shape->len; dimension++) {
+            uint64_t extent = 0;
+            if (json_nonnegative_integer(shape->kids[dimension],
+                                         ldexp(1.0, 63), &extent) != 0 ||
+                (extent && tensor.numel > UINT64_MAX / extent)) {
+                result = set_error(error, error_size,
+                                   "invalid shape for %s in %s", name, path);
+                goto cleanup;
+            }
+            tensor.shape[dimension] = (int64_t)extent;
+            tensor.numel *= extent;
+        }
+
         tensor.name = strdup(name);
         if (!tensor.name) {
-            free(arena);
-            free(header);
-            close(fd);
-            return set_error(error, error_size, "out of memory indexing %s", path);
+            result = set_error(error, error_size, "out of memory indexing %s", path);
+            goto cleanup;
         }
         tensor.shard = shard;
         tensor.offset = data_start + start;
         tensor.nbytes = end - start;
-        tensor.rank = shape->len;
-        tensor.numel = 1;
-        for (int dimension = 0; dimension < shape->len; dimension++) {
-            tensor.shape[dimension] = (int64_t)shape->kids[dimension]->num;
-            tensor.numel *= (uint64_t)tensor.shape[dimension];
-        }
         if (append_tensor(index, &tensor) != 0) {
             free((char *)tensor.name);
-            free(arena);
-            free(header);
-            close(fd);
-            return set_error(error, error_size, "out of memory indexing %s", path);
+            result = set_error(error, error_size, "out of memory indexing %s", path);
+            goto cleanup;
         }
     }
+
+    char *stored_path = strdup(path);
+    if (!stored_path) {
+        result = set_error(error, error_size, "out of memory storing %s", path);
+        goto cleanup;
+    }
+    index->shards[shard].path = stored_path;
+    index->shards[shard].fd = fd;
+    index->shards[shard].size = shard_size;
+    index->shard_count++;
+    fd = -1;
+    result = 0;
+
+cleanup:
+    json_free(root);
     free(arena);
     free(header);
-    index->shards[shard].path = strdup(path);
-    index->shards[shard].fd = fd;
-    index->shards[shard].size = (uint64_t)status.st_size;
-    if (!index->shards[shard].path) {
-        close(fd);
-        return set_error(error, error_size, "out of memory storing %s", path);
-    }
-    index->shard_count++;
-    return 0;
+    if (fd >= 0) close(fd);
+    return result;
 }
 
 static int build_hash(ColiSafetensorsIndex *index, char *error, size_t error_size) {

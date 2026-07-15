@@ -186,6 +186,9 @@ def main() -> int:
             binary = candidate
     if not binary.exists():
         raise SystemExit(f"binary not found: {binary}")
+    # Path("./deepseek_v4") stringifies to "deepseek_v4". subprocess would
+    # then search PATH instead of executing the binary in the current directory.
+    binary = binary.resolve()
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

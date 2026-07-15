@@ -41,6 +41,25 @@ c/tests/test_deepseek_v4
 c/tests/test_deepseek_v4.exe
 c/deepseek_v4
 c/deepseek_v4.exe
+c/COLI_V4_UNIT_*.o
+c/safetensors_index.o
+c/tensor_io.o
+c/native_quant.o
+c/native_quant_parallel.o
+c/native_quant_dual.o
+c/native_quant_batch_avx512.o
+c/native_quant_fp4_rows16.o
+c/build/ownership/
+c/tests/test_safetensors_index
+c/tests/test_safetensors_index.exe
+c/tests/test_expert_store_ops
+c/tests/test_expert_store_ops.exe
+c/tests/test_native_quant
+c/tests/test_native_quant.exe
+c/tests/test_tensor_io
+c/tests/test_tensor_io.exe
+c/tests/test_v4_ownership
+c/tests/test_v4_ownership.exe
 
 # oracoli tiny generati (make_glm_oracle.py) e dati benchmark scaricati
 c/glm_tiny/

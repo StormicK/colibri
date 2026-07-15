@@ -253,10 +253,9 @@ int coli_v4_layer_load(ColiV4Engine *engine,
     if (!engine || !weights || !config || !index || layer < 0 ||
         layer >= config->num_hidden_layers ||
         layer >= COLI_V4_RESIDENT_MAX_LAYERS_V2) return -1;
-    if ((engine->dense_resident.config &&
-         engine->dense_resident.config != config) ||
-        (engine->dense_resident.index &&
-         engine->dense_resident.index != index)) {
+    /* Configs are copied into sessions and CLI validation contexts. The shard
+     * index, not the address of an equivalent config copy, identifies a model. */
+    if (engine->dense_resident.index && engine->dense_resident.index != index) {
         if (error && error_size)
             snprintf(error, error_size,
                      "resident V4 dense cache cannot switch model instances");
@@ -7365,6 +7364,8 @@ int main(int argc, char **argv) {
         prompt_ids = v4_oracle_read_ids(root, "prompt_ids", &prompt_count);
         full_ids = v4_oracle_read_ids(root, "full_ids", &full_count);
         tf_pred = v4_oracle_read_ids(root, "tf_pred", &tf_count);
+        json_free(root);
+        free(arena);
         if (!prompt_ids || !full_ids || !tf_pred ||
             prompt_count < 1 || full_count <= prompt_count ||
             tf_count < 1) {
@@ -8523,6 +8524,7 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
     char *arena = NULL;
     jval *root = json_parse(json, &arena);
     if (!root || root->t != J_OBJ) {
+        json_free(root);
         free(arena);
         return set_error(error, error_size, "DeepSeek-V4 config is not an object");
     }
@@ -8560,6 +8562,7 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
         required_float(root, "rope_theta", &config->rope_theta, error, error_size) ||
         required_float(root, "compress_rope_theta", &config->compress_rope_theta, error, error_size);
     if (failed) {
+        json_free(root);
         free(arena);
         return -1;
     }
@@ -8570,18 +8573,21 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
         required_int(rope, "beta_fast", &config->rope_beta_fast, error, error_size) ||
         required_int(rope, "beta_slow", &config->rope_beta_slow, error, error_size) ||
         required_float(rope, "factor", &config->rope_factor, error, error_size)) {
+        json_free(root);
         free(arena);
         return -1;
     }
     jval *ratios = json_get(root, "compress_ratios");
     if (!ratios || ratios->t != J_ARR || ratios->len < 1 ||
         ratios->len > COLI_V4_MAX_LAYERS) {
+        json_free(root);
         free(arena);
         return set_error(error, error_size, "invalid compress_ratios");
     }
     config->compress_ratio_count = ratios->len;
     for (int index = 0; index < ratios->len; index++) {
         if (ratios->kids[index]->t != J_NUM) {
+            json_free(root);
             free(arena);
             return set_error(error, error_size, "non-numeric compress ratio");
         }
@@ -8591,6 +8597,7 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
     if (!quantization || quantization->t != J_OBJ ||
         require_string(quantization, "fmt", "e4m3", error, error_size) ||
         require_string(quantization, "scale_fmt", "ue8m0", error, error_size)) {
+        json_free(root);
         free(arena);
         return -1;
     }
@@ -8601,9 +8608,11 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
         config->n_shared_experts != 1 || config->hc_mult < 1 ||
         config->compress_ratio_count != config->num_hidden_layers +
                                         config->num_nextn_predict_layers) {
+        json_free(root);
         free(arena);
         return set_error(error, error_size, "inconsistent DeepSeek-V4 config dimensions");
     }
+    json_free(root);
     free(arena);
     return 0;
 }

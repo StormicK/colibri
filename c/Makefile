@@ -155,14 +155,22 @@ PYTHON    ?= python3
 endif
 CUDA_OBJ  =
 
-# DeepSeek V4 amalgamation needs x86-64 -march / AVX paths; keep it off
-# macOS / PowerPC / other hosts so `make check` still validates GLM + infra.
+# DeepSeek V4 uses x86-64-specific compiler flags. Gate it from the compiler
+# target triple so native Windows shells and cross builds make the same choice.
 COLI_V4_SUPPORTED :=
-ifeq ($(IS_WIN),1)
+V4_TARGET_X86_64 := $(filter x86_64% amd64%,$(TRIPLET))
+ifneq ($(V4_TARGET_X86_64),)
+ifneq (,$(IS_WIN)$(LINUX))
+COLI_V4_SUPPORTED := 1
+endif
+else ifeq ($(TRIPLET),)
+# Fallback only when the compiler cannot report a target triple.
+ifneq (,$(IS_WIN))
 COLI_V4_SUPPORTED := 1
 else ifeq ($(UNAME_S),Linux)
 ifneq (,$(filter x86_64 amd64,$(UNAME_M)))
 COLI_V4_SUPPORTED := 1
+endif
 endif
 endif
 
@@ -341,114 +349,10 @@ tests/test_safetensors_index$(EXE): tests/test_safetensors_index.c safetensors_i
 tests/test_native_quant$(EXE): tests/test_native_quant.c native_quant.c native_quant.h tensor.h
 	$(CC) $(CFLAGS) native_quant.c $< -o $@ $(LDFLAGS)
 
-tests/test_deepseek_v4_expert_store$(EXE): tests/test_deepseek_v4_expert_store.c deepseek_v4_expert_store.c deepseek_v4_expert_store.h safetensors_index.c safetensors_index.h expert_store.h tensor.h json.h
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_expert_store.c $< \
-		-o $@ -pthread $(LDFLAGS)
-
-tests/test_deepseek_v4_math$(EXE): tests/test_deepseek_v4_math.c deepseek_v4_math.c deepseek_v4_math.h
-	$(CC) $(CFLAGS) deepseek_v4_math.c $< -o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_expert$(EXE): tests/test_deepseek_v4_expert.c deepseek_v4_expert.c deepseek_v4_expert.h deepseek_v4_math.c deepseek_v4_math.h native_quant.c native_quant.h expert_store.h tensor.h
-	$(CC) $(CFLAGS) native_quant.c deepseek_v4_math.c deepseek_v4_expert.c $< \
-		-o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_config$(EXE): tests/test_deepseek_v4_config.c deepseek_v4_config.c deepseek_v4_config.h json.h
-	$(CC) $(CFLAGS) deepseek_v4_config.c $< -o $@ $(LDFLAGS)
-
 tests/test_tensor_io$(EXE): tests/test_tensor_io.c tensor_io.c tensor_io.h native_quant.c native_quant.h safetensors_index.c safetensors_index.h tensor.h json.h
 	$(CC) $(CFLAGS) safetensors_index.c native_quant.c tensor_io.c $< \
 		-o $@ $(LDFLAGS)
 
-tests/test_deepseek_v4_layer$(EXE): tests/test_deepseek_v4_layer.c deepseek_v4_layer.c deepseek_v4_layer.h deepseek_v4_config.h safetensors_index.c safetensors_index.h json.h
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_layer.c $< \
-		-o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_sparse_attention$(EXE): tests/test_deepseek_v4_sparse_attention.c deepseek_v4_sparse_attention.c deepseek_v4_sparse_attention.h native_quant.c native_quant.h
-	$(CC) $(CFLAGS) deepseek_v4_sparse_attention.c native_quant.c $< -o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_kv_cache$(EXE): tests/test_deepseek_v4_kv_cache.c deepseek_v4_kv_cache.c deepseek_v4_kv_cache.h
-	$(CC) $(CFLAGS) deepseek_v4_kv_cache.c $< -o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_attention_cache$(EXE): tests/test_deepseek_v4_attention_cache.c deepseek_v4_attention_cache.c deepseek_v4_attention_cache.h deepseek_v4_kv_cache.c deepseek_v4_kv_cache.h deepseek_v4_sparse_attention.c deepseek_v4_sparse_attention.h native_quant.c native_quant.h
-	$(CC) $(CFLAGS) deepseek_v4_attention_cache.c deepseek_v4_kv_cache.c \
-		deepseek_v4_sparse_attention.c native_quant.c $< -o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_resource_plan$(EXE): tests/test_deepseek_v4_resource_plan.c deepseek_v4_resource_plan.c deepseek_v4_resource_plan.h
-	$(CC) $(CFLAGS) deepseek_v4_resource_plan.c $< -o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_prompt$(EXE): tests/test_deepseek_v4_prompt.c deepseek_v4_prompt.c deepseek_v4_prompt.h
-	$(CC) $(CFLAGS) deepseek_v4_prompt.c $< -o $@ $(LDFLAGS)
-probe-v4-layers: tools/probe_deepseek_v4_layers$(EXE)
-	./tools/probe_deepseek_v4_layers$(EXE) $(MODEL) $(LAYER)
-
-tools/probe_deepseek_v4_layers$(EXE): tools/probe_deepseek_v4_layers.c deepseek_v4_layer.c deepseek_v4_config.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c $< \
-		-o $@ $(LDFLAGS)
-
-probe-v4-attention: tools/probe_deepseek_v4_attention$(EXE)
-	./tools/probe_deepseek_v4_attention$(EXE) $(MODEL) $(TOKEN) $(OUTPUT)
-
-tools/probe_deepseek_v4_attention$(EXE): tools/probe_deepseek_v4_attention.c deepseek_v4_attention.c deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_sparse_attention.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c deepseek_v4_sparse_attention.c \
-		deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_attention.c $< -o $@ $(LDFLAGS)
-
-probe-v4-block: tools/probe_deepseek_v4_block$(EXE)
-	./tools/probe_deepseek_v4_block$(EXE) $(MODEL) $(TOKEN) $(OUTPUT)
-
-tools/probe_deepseek_v4_block$(EXE): tools/probe_deepseek_v4_block.c deepseek_v4_block.c deepseek_v4_attention.c deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_sparse_attention.c deepseek_v4_expert.c deepseek_v4_expert_store.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c deepseek_v4_sparse_attention.c \
-		deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_attention.c \
-		deepseek_v4_expert.c deepseek_v4_expert_store.c deepseek_v4_block.c $< \
-		-o $@ -pthread $(LDFLAGS)
-
-probe-v4-compressor: tools/probe_deepseek_v4_compressor$(EXE)
-	./tools/probe_deepseek_v4_compressor$(EXE) $(MODEL) $(OUTPUT)
-
-tools/probe_deepseek_v4_compressor$(EXE): tools/probe_deepseek_v4_compressor.c deepseek_v4_compressor.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c deepseek_v4_compressor.c $< -o $@ $(LDFLAGS)
-
-probe-v4-ratio4-compressor: tools/probe_deepseek_v4_ratio4_compressor$(EXE)
-	./tools/probe_deepseek_v4_ratio4_compressor$(EXE) $(MODEL) $(OUTPUT)
-
-tools/probe_deepseek_v4_ratio4_compressor$(EXE): tools/probe_deepseek_v4_ratio4_compressor.c deepseek_v4_compressor.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c deepseek_v4_compressor.c $< -o $@ $(LDFLAGS)
-
-probe-v4-indexer: tools/probe_deepseek_v4_indexer$(EXE)
-	./tools/probe_deepseek_v4_indexer$(EXE) $(MODEL) $(OUTPUT)
-
-tools/probe_deepseek_v4_indexer$(EXE): tools/probe_deepseek_v4_indexer.c deepseek_v4_indexer.c deepseek_v4_indexer.h deepseek_v4_compressor.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c deepseek_v4_compressor.c \
-		deepseek_v4_indexer.c $< -o $@ $(LDFLAGS)
-
-probe-v4-attention-sequence: tools/probe_deepseek_v4_attention_sequence$(EXE)
-	./tools/probe_deepseek_v4_attention_sequence$(EXE) $(MODEL) $(OUTPUT)
-
-tools/probe_deepseek_v4_attention_sequence$(EXE): tools/probe_deepseek_v4_attention_sequence.c deepseek_v4_attention.c deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_sparse_attention.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c deepseek_v4_sparse_attention.c \
-		deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_attention.c $< -o $@ $(LDFLAGS)
-
-deepseek-v4-first-token: tools/deepseek_v4_first_token$(EXE)
-	./tools/deepseek_v4_first_token$(EXE) $(MODEL) $(TOKEN) $(COUNT)
-
-deepseek-v4-tokenizer: tools/deepseek_v4_tokenizer$(EXE)
-	./tools/deepseek_v4_tokenizer$(EXE) $(MODEL) "$(TEXT)"
-
-tools/deepseek_v4_tokenizer$(EXE): tools/deepseek_v4_tokenizer.c tok.h tok_unicode.h json.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tools/deepseek_v4_first_token$(EXE): tools/deepseek_v4_first_token.c tok.h tok_unicode.h json.h deepseek_v4_block.c deepseek_v4_attention.c deepseek_v4_sparse_attention.c deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_expert.c deepseek_v4_expert_store.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c tensor_io.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c tensor_io.c deepseek_v4_attention.c \
-		deepseek_v4_compressor.c deepseek_v4_indexer.c \
-		deepseek_v4_sparse_attention.c deepseek_v4_expert.c \
-		deepseek_v4_expert_store.c deepseek_v4_block.c $< \
-		-o $@ -pthread $(LDFLAGS)
 ifeq ($(COLI_V4_SUPPORTED),1)
 # Merged DeepSeek V4 unit tests — objects from amalgamated units (test-only + deps).
 include Makefile.deepseek-v4.units
@@ -528,7 +432,5 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all glm deepseek-v4 deepseek-v4-oracle cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench \
-	probe-v4-layers probe-v4-attention probe-v4-block probe-v4-compressor \
-	probe-v4-ratio4-compressor probe-v4-indexer probe-v4-attention-sequence \
-	deepseek-v4-first-token deepseek-v4-tokenizer
+.PHONY: all glm deepseek-v4 deepseek-v4-oracle cuda-test cuda-bench cuda-dll \
+	portable test-c test-python test check clean install uninstall bench
