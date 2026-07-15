@@ -2292,6 +2292,54 @@ void coli_v4_dspark_runner_close(ColiV4DSparkRunner *runner) {
 #include "native_quant.h"
 #include "tensor_io.h"
 
+#ifdef __AVX2__
+#include <immintrin.h>
+
+/* 8 BF16 weights -> f32 lanes: widen to 32 bit, shift into the exponent/
+ * mantissa position. Exact (BF16 is truncated f32). */
+static inline __m256 head_bf16_load8(const uint16_t *weight) {
+    __m128i raw = _mm_loadu_si128((const __m128i *)weight);
+    return _mm256_castsi256_ps(
+        _mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16));
+}
+
+static inline float head_hsum256(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v),
+                          _mm256_extractf128_ps(v, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    return _mm_cvtss_f32(s);
+}
+#endif
+
+/* One BF16 head row against `batch` hidden states; sums[item] gets the dot.
+ * The scalar path replicates the original element order exactly. Shared
+ * with the single-token head_argmax in the runtime unit. */
+void coli_v4_head_row_dot(float *sums, const uint16_t *weight,
+                          const float *hidden, int d, int batch) {
+    int i = 0;
+#ifdef __AVX2__
+    enum { HEAD_BATCH_MAX = 64 };
+    __m256 acc[HEAD_BATCH_MAX];
+    for (int item = 0; item < batch; item++) acc[item] = _mm256_setzero_ps();
+    for (; i + 8 <= d; i += 8) {
+        __m256 decoded = head_bf16_load8(weight + i);
+        for (int item = 0; item < batch; item++)
+            acc[item] = _mm256_fmadd_ps(
+                decoded, _mm256_loadu_ps(hidden + (size_t)item * d + i),
+                acc[item]);
+    }
+    for (int item = 0; item < batch; item++) sums[item] = head_hsum256(acc[item]);
+#else
+    for (int item = 0; item < batch; item++) sums[item] = 0.0f;
+#endif
+    for (; i < d; i++) {
+        float decoded = coli_bf16_decode(weight[i]);
+        for (int item = 0; item < batch; item++)
+            sums[item] += decoded * hidden[(size_t)item * d + i];
+    }
+}
+
 int coli_v4_target_load_embeddings(float *states_hc,
                                     const ColiSafetensorsIndex *index,
                                     const ColiDeepSeekV4Config *config,
@@ -2369,12 +2417,7 @@ int coli_v4_target_head_argmax_batch(
         #pragma omp parallel for schedule(static)
         for (int row = 0; row < config->vocab_size; row++) {
             float sums[64] = {0};
-            const uint16_t *weight = resident + (size_t)row * d;
-            for (int i = 0; i < d; i++) {
-                float decoded = coli_bf16_decode(weight[i]);
-                for (int item = 0; item < batch; item++)
-                    sums[item] += decoded * hidden[(size_t)item * d + i];
-            }
+            coli_v4_head_row_dot(sums, resident + (size_t)row * d, hidden, d, batch);
             for (int item = 0; item < batch; item++)
                 resident_scores[(size_t)item * config->vocab_size + row] =
                     sums[item];
@@ -2406,9 +2449,9 @@ int coli_v4_target_head_argmax_batch(
                             (size_t)rows * d * sizeof(*raw), raw)) return -1;
         #pragma omp parallel for collapse(2) schedule(static)
         for (int item = 0; item < batch; item++) for (int row = 0; row < rows; row++) {
-            float sum = 0.0f; const uint16_t *weight = raw + (size_t)row * d;
+            float sum; const uint16_t *weight = raw + (size_t)row * d;
             const float *input = hidden + (size_t)item * d;
-            for (int i = 0; i < d; i++) sum += coli_bf16_decode(weight[i]) * input[i];
+            coli_v4_head_row_dot(&sum, weight, input, d, 1);
             scores[(size_t)item * ROWS + row] = sum;
         }
         for (int item = 0; item < batch; item++) for (int row = 0; row < rows; row++) {

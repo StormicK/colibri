@@ -332,6 +332,9 @@ int coli_v4_target_head_argmax_batch(
     const float *states_hc, const ColiSafetensorsIndex *index,
     const ColiDeepSeekV4Config *config, int batch,
     int *tokens, float *logits, char *error, size_t error_size);
+/* One BF16 head row dotted with `batch` hidden states (AVX2 when built). */
+void coli_v4_head_row_dot(float *sums, const uint16_t *weight,
+                          const float *hidden, int d, int batch);
 /* ==== end deepseek_v4_target_head_batch.h ==== */
 
 #endif /* COLIBRI_DEEPSEEK_V4_DSPARK_H */
