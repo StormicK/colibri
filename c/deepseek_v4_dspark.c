@@ -1206,11 +1206,15 @@ int coli_v4_dspark_attention_precompute_context(
         if (!result) {
             memcpy(item_kv, qdq, nope * sizeof(*item_kv));
             coli_bf16_round_array(item_kv, nope);
-            int slot = position % state->window_size;
-            memcpy(state->kv + (size_t)slot * d, item_kv,
-                   (size_t)d * sizeof(*item_kv));
-            state->positions[slot] = position;
-            if (state->valid < state->window_size) state->valid++;
+            int slot = coli_v4_dspark_position_window_put(
+                state->positions, state->window_size, &state->valid, position);
+            if (slot < 0)
+                result = ds_attn_error(
+                    error, error_size,
+                    "invalid DSpark context window update position=%d", position);
+            else
+                memcpy(state->kv + (size_t)slot * d, item_kv,
+                       (size_t)d * sizeof(*item_kv));
         }
         free(scales); free(qdq);
     }
@@ -1264,16 +1268,23 @@ int coli_v4_dspark_attention_block(
         return ds_attn_error(error, error_size, "out of memory in DSpark block");
     }
     int result = coli_fp8_matmul_batch_ref(qa, &wqa, inputs, batch);
+    if (result) ds_attn_error(error, error_size,
+                              "DSpark attention q_a matmul failed");
     if (!result) coli_bf16_round_array(qa, (size_t)batch * qr);
     const uint16_t *qnorm = ds_layer_data(weights, "attn.q_norm.weight", NULL);
-    if (!qnorm) result = -1;
+    if (!qnorm) result = ds_attn_error(
+        error, error_size, "missing DSpark attention q_norm");
     for (int i = 0; !result && i < qr; i++) norm[i] = coli_bf16_decode(qnorm[i]);
     for (int item = 0; !result && item < batch; item++) {
         float *row = qa + (size_t)item * qr;
         result = coli_v4_rmsnorm(row, row, norm, qr, config->rms_norm_eps);
         if (!result) coli_bf16_round_array(row, (size_t)qr);
     }
-    if (!result) result = coli_fp8_matmul_batch_ref(q, &wqb, qa, batch);
+    if (!result) {
+        result = coli_fp8_matmul_batch_ref(q, &wqb, qa, batch);
+        if (result) ds_attn_error(error, error_size,
+                                  "DSpark attention q_b matmul failed");
+    }
     if (!result) coli_bf16_round_array(q, (size_t)batch * qwidth);
     for (int item = 0; !result && item < batch; item++)
         for (int head = 0; head < heads; head++) {
@@ -1283,14 +1294,23 @@ int coli_v4_dspark_attention_block(
             float scale = 1.0f / sqrtf(squares / d + config->rms_norm_eps);
             for (int i = 0; i < d; i++) row[i] = coli_bf16_round(row[i] * scale);
         }
-    if (!result) result = coli_fp8_matmul_batch_ref(kv, &wkv, inputs, batch);
+    if (!result) {
+        result = coli_fp8_matmul_batch_ref(kv, &wkv, inputs, batch);
+        if (result) ds_attn_error(error, error_size,
+                                  "DSpark attention query KV matmul failed");
+    }
     if (!result) coli_bf16_round_array(kv, (size_t)batch * d);
     const uint16_t *knorm = ds_layer_data(weights, "attn.kv_norm.weight", NULL);
-    if (!knorm) result = -1;
+    if (!knorm) result = ds_attn_error(
+        error, error_size, "missing DSpark attention kv_norm");
     for (int i = 0; !result && i < d; i++) norm[i] = coli_bf16_decode(knorm[i]);
-    if (!result) result = coli_v4_rope_precompute(
-        cosines, sines, rope, end, 0, config->rope_theta,
-        config->rope_factor, config->rope_beta_fast, config->rope_beta_slow);
+    if (!result) {
+        result = coli_v4_rope_precompute(
+            cosines, sines, rope, end, 0, config->rope_theta,
+            config->rope_factor, config->rope_beta_fast, config->rope_beta_slow);
+        if (result) ds_attn_error(error, error_size,
+                                  "DSpark attention RoPE precompute failed");
+    }
     for (int item = 0; !result && item < batch; item++) {
         int position = query_start_position + item;
         float *item_kv = kv + (size_t)item * d;
@@ -1312,7 +1332,10 @@ int coli_v4_dspark_attention_block(
         float *qdq = malloc(nope * sizeof(float));
         uint8_t *scales = malloc((nope + 63) / 64);
         if (!qdq || !scales || coli_fp8_activation_qdq_ref(
-                qdq, scales, item_kv, nope, 64)) result = -1;
+                qdq, scales, item_kv, nope, 64))
+            result = ds_attn_error(
+                error, error_size,
+                "DSpark attention query KV quantization failed item=%d", item);
         if (!result) {
             memcpy(item_kv, qdq, nope * sizeof(float));
             coli_bf16_round_array(item_kv, nope);
@@ -1326,7 +1349,10 @@ int coli_v4_dspark_attention_block(
                    state->kv + (size_t)slot * d, (size_t)d * sizeof(float));
             copied++;
         }
-    if (copied != context) result = -1;
+    if (copied != context) result = ds_attn_error(
+        error, error_size,
+        "DSpark attention context state mismatch valid=%d copied=%d",
+        context, copied);
     if (!result) memcpy(all_kv + (size_t)context * d, kv,
                         (size_t)batch * d * sizeof(float));
     for (int i = 0; i < kv_count; i++) indices[i] = i;
@@ -1336,6 +1362,10 @@ int coli_v4_dspark_attention_block(
             attended + (size_t)item * qwidth,
             q + (size_t)item * qwidth, all_kv, sinks, indices,
             heads, d, kv_count, kv_count, 1.0f / sqrtf((float)d));
+        if (result) ds_attn_error(
+            error, error_size,
+            "DSpark sparse attention failed item=%d position=%d context=%d",
+            item, query_start_position + item, context);
         int position = query_start_position + item;
         for (int head = 0; !result && head < heads; head++) {
             float *r = attended + (size_t)item * qwidth +
@@ -1352,7 +1382,8 @@ int coli_v4_dspark_attention_block(
     int scale_rows = (orank + 127) / 128;
     float *group_inputs = malloc((size_t)batch * group_width * sizeof(float));
     float *group_outputs = malloc((size_t)batch * orank * sizeof(float));
-    if (!group_inputs || !group_outputs) result = -1;
+    if (!group_inputs || !group_outputs) result = ds_attn_error(
+        error, error_size, "out of memory in DSpark grouped output");
     for (int group = 0; !result && group < groups; group++) {
         for (int item = 0; item < batch; item++)
             memcpy(group_inputs + (size_t)item * group_width,
@@ -1369,19 +1400,31 @@ int coli_v4_dspark_attention_block(
         view.scale_bytes = (size_t)scale_rows * scale_columns;
         result = coli_fp8_matmul_batch_ref(group_outputs, &view,
                                             group_inputs, batch);
+        if (result) ds_attn_error(
+            error, error_size,
+            "DSpark attention o_a matmul failed group=%d rows=%lld columns=%lld "
+            "data_bytes=%zu scale_bytes=%zu",
+            group, (long long)view.rows, (long long)view.columns,
+            view.data_bytes, view.scale_bytes);
         for (int item = 0; !result && item < batch; item++)
             memcpy(oa + (size_t)item * oawidth + (size_t)group * orank,
                    group_outputs + (size_t)item * orank,
                    (size_t)orank * sizeof(float));
     }
     if (!result) coli_bf16_round_array(oa, (size_t)batch * oawidth);
-    if (!result) result = coli_fp8_matmul_batch_ref(outputs, &wob, oa, batch);
+    if (!result) {
+        result = coli_fp8_matmul_batch_ref(outputs, &wob, oa, batch);
+        if (result) ds_attn_error(error, error_size,
+                                  "DSpark attention o_b matmul failed");
+    }
     if (!result) coli_bf16_round_array(outputs, (size_t)batch * hidden);
     free(group_outputs); free(group_inputs); free(indices); free(all_kv);
     free(sines); free(cosines); free(norm); free(oa); free(attended);
     free(kv); free(q); free(qa);
-    return result ? ds_attn_error(error, error_size,
-                                  "DSpark non-causal attention failed") : 0;
+    if (!result) return 0;
+    if (error && error_size && error[0]) return -1;
+    return ds_attn_error(error, error_size,
+                         "DSpark non-causal attention failed");
 }
 #endif /* COLI_V4_UNIT_DSPARK_ATTENTION */
 
@@ -1689,7 +1732,8 @@ static int moe_batch(float *outputs,
                      const ColiDeepSeekV4LayerWeights *weights,
                      const ColiDeepSeekV4Config *config,
                      ColiExpertStore *store, const float *inputs,
-                     const int *tokens, int batch) {
+                     const int *tokens, int batch,
+                     char *error, size_t error_size) {
     int d = config->hidden_size, n = config->n_routed_experts;
     int topk = config->num_experts_per_tok;
     float *gate = malloc((size_t)n * d * sizeof(*gate));
@@ -1704,32 +1748,57 @@ static int moe_batch(float *outputs,
         !compact_outputs || !compact_weights || !compact_items) {
         free(compact_items); free(compact_weights); free(compact_outputs);
         free(compact_inputs); free(shared); free(indices); free(route_weights);
-        free(gate); return -1;
+        free(gate);
+        return set_error(error, error_size,
+                         "out of memory in DSpark MoE scratch");
     }
-    decode_bf16(gate, value(weights, "ffn.gate.weight", NULL), (size_t)n * d);
+    const uint16_t *raw_gate = value(weights, "ffn.gate.weight", NULL);
+    if (!raw_gate) {
+        free(compact_items); free(compact_weights); free(compact_outputs);
+        free(compact_inputs); free(shared); free(indices); free(route_weights);
+        free(gate);
+        return set_error(error, error_size, "missing DSpark MoE gate weight");
+    }
+    decode_bf16(gate, raw_gate, (size_t)n * d);
     const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
     const float *bias = value(weights, "ffn.gate.bias", NULL);
     int result = 0;
     for (int item = 0; !result && item < batch; item++) {
         int *item_indices = indices + (size_t)item * topk;
         float *item_weights = route_weights + (size_t)item * topk;
-        if (tokens[item] < 0 || tokens[item] >= config->vocab_size) result = -1;
+        if (tokens[item] < 0 || tokens[item] >= config->vocab_size)
+            result = set_error(
+                error, error_size,
+                "DSpark MoE invalid token item=%d token=%d vocab=%d",
+                item, tokens[item], config->vocab_size);
         if (!result && weights->plan.uses_hash_router) {
-            if (!table) result = -1;
+            if (!table) result = set_error(
+                error, error_size, "missing DSpark MoE hash routing table");
             else for (int i = 0; i < topk; i++)
                 item_indices[i] = (int)table[(size_t)tokens[item] * topk + i];
         }
-        if (!result) result = coli_v4_route(
-            item_weights, item_indices, inputs + (size_t)item * d,
-            gate, bias, weights->plan.uses_hash_router ? item_indices : NULL,
-            n, d, topk, config->routed_scaling_factor);
+        if (!result && coli_v4_route(
+                item_weights, item_indices, inputs + (size_t)item * d,
+                gate, bias, weights->plan.uses_hash_router ? item_indices : NULL,
+                n, d, topk, config->routed_scaling_factor))
+            result = set_error(error, error_size,
+                               "DSpark MoE routing failed item=%d token=%d",
+                               item, tokens[item]);
     }
     ColiTensorView w1, w2, w3;
-    if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
-                    fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
-                    fp8_view(&w3, weights, "ffn.shared_experts.w3"))) result = -1;
-    if (!result) result = shared_expert_batch(
-        shared, &w1, &w2, &w3, inputs, batch, config->swiglu_limit);
+    if (!result && fp8_view(&w1, weights, "ffn.shared_experts.w1"))
+        result = set_error(error, error_size,
+                           "invalid DSpark shared expert w1");
+    if (!result && fp8_view(&w2, weights, "ffn.shared_experts.w2"))
+        result = set_error(error, error_size,
+                           "invalid DSpark shared expert w2");
+    if (!result && fp8_view(&w3, weights, "ffn.shared_experts.w3"))
+        result = set_error(error, error_size,
+                           "invalid DSpark shared expert w3");
+    if (!result && shared_expert_batch(
+            shared, &w1, &w2, &w3, inputs, batch, config->swiglu_limit))
+        result = set_error(error, error_size,
+                           "DSpark shared expert batch failed");
     if (!result) memset(outputs, 0, (size_t)batch * d * sizeof(*outputs));
 
     for (int expert_id = 0; !result && expert_id < n; expert_id++) {
@@ -1750,10 +1819,20 @@ static int moe_batch(float *outputs,
         ColiExpertView expert;
         if (coli_expert_lookup(store,
                                (ColiExpertKey){weights->plan.layer, expert_id},
-                               &expert)) { result = -1; break; }
-        result = routed_expert_batch(compact_outputs, &expert, compact_inputs,
-                                     compact_weights, count,
-                                     config->swiglu_limit);
+                               &expert)) {
+            result = set_error(
+                error, error_size,
+                "DSpark expert lookup failed layer=%d expert=%d count=%d",
+                weights->plan.layer, expert_id, count);
+            break;
+        }
+        if (routed_expert_batch(compact_outputs, &expert, compact_inputs,
+                                compact_weights, count,
+                                config->swiglu_limit))
+            result = set_error(
+                error, error_size,
+                "DSpark routed expert batch failed layer=%d expert=%d count=%d",
+                weights->plan.layer, expert_id, count);
         coli_expert_release(store, &expert);
         for (int compact = 0; !result && compact < count; compact++) {
             float *destination = outputs + (size_t)compact_items[compact] * d;
@@ -1817,7 +1896,8 @@ int coli_v4_block_window_batch_ref(
             weights, config, "ffn", "ffn_norm.weight");
     }
     if (!result) result = moe_batch(branches, weights, config, experts,
-                                    normalized_ffn, tokens, batch);
+                                    normalized_ffn, tokens, batch,
+                                    error, error_size);
     for (int item = 0; !result && item < batch; item++) {
         result = coli_v4_hc_post(
             outputs_hc + (size_t)item * hd,
@@ -1847,8 +1927,10 @@ int coli_v4_dspark_block(
     const float *inputs_hc, const int *tokens,
     int query_start_position, int batch,
     char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
     if (!outputs_hc || !attention || !weights || !config || !experts ||
-        !inputs_hc || !tokens || batch < 1 || batch > 64) return -1;
+        !inputs_hc || !tokens || batch < 1 || batch > 64)
+        return set_error(error, error_size, "invalid DSpark block arguments");
     int d = config->hidden_size, hc = config->hc_mult;
     size_t hd = (size_t)hc * d;
     float *states = malloc((size_t)batch * hd * sizeof(float));
@@ -1865,19 +1947,27 @@ int coli_v4_dspark_block(
         !ffn_norm || !ffn_branch || !ffn_post || !ffn_comb || !reduced) {
         free(reduced); free(ffn_comb); free(ffn_post); free(ffn_branch);
         free(ffn_norm); free(attn_comb); free(attn_post); free(attn_branch);
-        free(attn_norm); free(states); return -1;
+        free(attn_norm); free(states);
+        return set_error(error, error_size,
+                         "out of memory in DSpark block scratch");
     }
     int result = 0;
-    for (int item = 0; !result && item < batch; item++)
+    const char *failed_step = NULL;
+    for (int item = 0; !result && item < batch; item++) {
         result = normalized_hc_pre(
             reduced, attn_post + (size_t)item * hc,
             attn_comb + (size_t)item * hc * hc,
             attn_norm + (size_t)item * d,
             inputs_hc + (size_t)item * hd,
             weights, config, "attn", "attn_norm.weight");
-    if (!result) result = coli_v4_dspark_attention_block(
-        attn_branch, attention, weights, config, attn_norm,
-        query_start_position, batch, error, error_size);
+        if (result) failed_step = "attention HC pre";
+    }
+    if (!result) {
+        result = coli_v4_dspark_attention_block(
+            attn_branch, attention, weights, config, attn_norm,
+            query_start_position, batch, error, error_size);
+        if (result) failed_step = "attention";
+    }
     for (int item = 0; !result && item < batch; item++) {
         result = coli_v4_hc_post(
             states + (size_t)item * hd,
@@ -1885,17 +1975,23 @@ int coli_v4_dspark_block(
             inputs_hc + (size_t)item * hd,
             attn_post + (size_t)item * hc,
             attn_comb + (size_t)item * hc * hc, hc, d);
+        if (result) failed_step = "attention HC post";
         if (!result) coli_bf16_round_array(states + (size_t)item * hd, hd);
     }
-    for (int item = 0; !result && item < batch; item++)
+    for (int item = 0; !result && item < batch; item++) {
         result = normalized_hc_pre(
             reduced, ffn_post + (size_t)item * hc,
             ffn_comb + (size_t)item * hc * hc,
             ffn_norm + (size_t)item * d,
             states + (size_t)item * hd,
             weights, config, "ffn", "ffn_norm.weight");
-    if (!result) result = moe_batch(
-        ffn_branch, weights, config, experts, ffn_norm, tokens, batch);
+        if (result) failed_step = "FFN HC pre";
+    }
+    if (!result) {
+        result = moe_batch(ffn_branch, weights, config, experts, ffn_norm,
+                           tokens, batch, error, error_size);
+        if (result) failed_step = "MoE";
+    }
     for (int item = 0; !result && item < batch; item++) {
         result = coli_v4_hc_post(
             outputs_hc + (size_t)item * hd,
@@ -1903,12 +1999,20 @@ int coli_v4_dspark_block(
             states + (size_t)item * hd,
             ffn_post + (size_t)item * hc,
             ffn_comb + (size_t)item * hc * hc, hc, d);
+        if (result) failed_step = "FFN HC post";
         if (!result) coli_bf16_round_array(outputs_hc + (size_t)item * hd, hd);
     }
     free(reduced); free(ffn_comb); free(ffn_post); free(ffn_branch);
     free(ffn_norm); free(attn_comb); free(attn_post); free(attn_branch);
     free(attn_norm); free(states);
-    return result ? set_error(error, error_size, "DSpark block failed") : 0;
+    if (!result) return 0;
+    char detail[256] = {0};
+    if (error && error_size && error[0])
+        snprintf(detail, sizeof(detail), "%s", error);
+    return set_error(error, error_size,
+                     "DSpark block failed layer=%d step=%s%s%s",
+                     weights->plan.layer, failed_step ? failed_step : "unknown",
+                     detail[0] ? ": " : "", detail);
 }
 #endif /* COLI_V4_UNIT_DSPARK_BLOCK */
 

@@ -6241,14 +6241,31 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
                         const ColiDeepSeekV4Config *config,
                         ColiExpertStore *experts, const int *tokens,
                         int start, int batch, char *error, size_t error_size) {
+    if (!state_ptr || !next_ptr || !*state_ptr || !*next_ptr || !attention ||
+        !index || !config || !experts || !tokens || start < 0 || batch < 1) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid target batch arguments");
+        return -1;
+    }
     float *state = *state_ptr, *next = *next_ptr;
+    size_t hd = (size_t)config->hc_mult * config->hidden_size;
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
                                error, error_size)) return -1;
-        int result = coli_v4_block_window_batch_ref(
-            next, attention[layer_id], &layer, config, experts,
-            state, tokens, start, batch, error, error_size);
+        int result = 0;
+        for (int offset = 0; !result && offset < batch; offset += 64) {
+            int chunk = batch - offset;
+            if (chunk > 64) chunk = 64;
+            result = coli_v4_block_window_batch_ref(
+                next + (size_t)offset * hd, attention[layer_id],
+                &layer, config, experts, state + (size_t)offset * hd,
+                tokens + offset, start + offset, chunk, error, error_size);
+            if (result && error && error_size && !error[0])
+                snprintf(error, error_size,
+                         "target prefill failed layer=%d offset=%d batch=%d",
+                         layer_id, offset, chunk);
+        }
         if (!result)
             coli_v4_dspark_capture_after_block(engine, &layer, config, next,
                                                batch);
@@ -6257,6 +6274,27 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
         float *swap = state; state = next; next = swap;
     }
     *state_ptr = state; *next_ptr = next; return 0;
+}
+
+static int dspark_prefill_chunks(ColiV4DSparkRunner *runner,
+                                 const float *main_x, int hidden_size,
+                                 int start_position, int batch,
+                                 char *error, size_t error_size) {
+    if (!runner || !main_x || hidden_size < 1 || start_position < 0 ||
+        batch < 1) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid chunked DSpark prefill");
+        return -1;
+    }
+    for (int offset = 0; offset < batch; offset += 64) {
+        int chunk = batch - offset;
+        if (chunk > 64) chunk = 64;
+        if (coli_v4_dspark_runner_prefill(
+                runner, main_x + (size_t)offset * hidden_size,
+                start_position + offset, chunk, error, error_size))
+            return -1;
+    }
+    return 0;
 }
 
 static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
@@ -6363,8 +6401,8 @@ int COLI_V4_GENERATE_MAIN(int argc, char **argv) {
     }
     if (coli_v4_dspark_runner_use_shared_heads(
             runner, coli_v4_dspark_capture_heads(NULL)) ||
-        coli_v4_dspark_runner_prefill(runner, main_x_batch, 0, prompt_count,
-                                      error, sizeof(error))) {
+        dspark_prefill_chunks(runner, main_x_batch, config.hidden_size,
+                              0, prompt_count, error, sizeof(error))) {
         coli_v4_dspark_runner_close(runner);
         fprintf(stderr, "%s\n", error); return 1;
     }
@@ -7000,8 +7038,8 @@ int coli_v4_session_generate(ColiV4Session *session,
         if (coli_v4_dspark_runner_use_shared_heads(
                 runner, coli_v4_dspark_capture_heads(engine)))
             return -1;
-        if (coli_v4_dspark_runner_prefill(runner, main_x_batch, 0, prompt_count,
-                                          error, error_size))
+        if (dspark_prefill_chunks(runner, main_x_batch, config->hidden_size,
+                                  0, prompt_count, error, error_size))
             return -1;
     }
 

@@ -88,6 +88,27 @@ int coli_deepseek_v4_dspark_expert_store_open(
 
 typedef struct ColiV4DSparkAttentionState ColiV4DSparkAttentionState;
 
+/*
+ * Record an absolute token position in a sparse fixed-size sliding window.
+ * Positions may jump when one speculative verification commits several
+ * tokens, so occupancy cannot be inferred from the number of writes.
+ */
+static inline int coli_v4_dspark_position_window_put(
+    int *positions, int window_size, int *valid, int position) {
+    if (!positions || !valid || window_size < 1 || position < 0) return -1;
+    int64_t minimum = (int64_t)position - window_size + 1;
+    for (int slot = 0; slot < window_size; slot++)
+        if (positions[slot] >= 0 && (int64_t)positions[slot] < minimum)
+            positions[slot] = -1;
+    int slot = position % window_size;
+    positions[slot] = position;
+    int occupied = 0;
+    for (int index = 0; index < window_size; index++)
+        if (positions[index] >= 0) occupied++;
+    *valid = occupied;
+    return slot;
+}
+
 int coli_v4_dspark_attention_create(ColiV4DSparkAttentionState **state,
                                     const ColiDeepSeekV4Config *config);
 void coli_v4_dspark_attention_reset(ColiV4DSparkAttentionState *state);

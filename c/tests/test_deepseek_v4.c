@@ -44,6 +44,38 @@ static int test_attention_cache(void) {
 }
 /* ==== end test_deepseek_v4_attention_cache.c ==== */
 
+static int test_dspark_position_window(void) {
+    enum { WINDOW = 8 };
+    int positions[WINDOW];
+    int valid = 0;
+    for (int slot = 0; slot < WINDOW; slot++) positions[slot] = -1;
+    const int sequence[] = {0, 1, 2, 3, 8, 11, 17, 17};
+    for (size_t item = 0; item < sizeof(sequence) / sizeof(sequence[0]); item++) {
+        int position = sequence[item];
+        int slot = coli_v4_dspark_position_window_put(
+            positions, WINDOW, &valid, position);
+        if (slot != position % WINDOW) return 1;
+        int occupied = 0;
+        int64_t minimum = (int64_t)position - WINDOW + 1;
+        for (int index = 0; index < WINDOW; index++) {
+            if (positions[index] < 0) continue;
+            if ((int64_t)positions[index] < minimum ||
+                positions[index] > position)
+                return 1;
+            occupied++;
+        }
+        if (valid != occupied) return 1;
+    }
+    if (valid != 2 || positions[1] != 17 || positions[3] != 11)
+        return 1;
+    if (coli_v4_dspark_position_window_put(NULL, WINDOW, &valid, 18) >= 0 ||
+        coli_v4_dspark_position_window_put(positions, 0, &valid, 18) >= 0 ||
+        coli_v4_dspark_position_window_put(positions, WINDOW, &valid, -1) >= 0)
+        return 1;
+    puts("DeepSeek-V4 DSpark position window tests: ok");
+    return 0;
+}
+
 /* ==== begin test_deepseek_v4_config.c ==== */
 /* umbrella headers */
 /* <stdio.h> */
@@ -650,6 +682,10 @@ static int test_sparse_attention(void) {
 int main(int argc, char **argv) {
     if (test_attention_cache() != 0) {
         fprintf(stderr, "FAIL: test_attention_cache\n");
+        return 1;
+    }
+    if (test_dspark_position_window() != 0) {
+        fprintf(stderr, "FAIL: test_dspark_position_window\n");
         return 1;
     }
     if (test_config(argc, argv) != 0) {
