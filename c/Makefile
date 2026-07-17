@@ -240,10 +240,19 @@ endif
 
 all: glm$(EXE)
 
-.PHONY: deepseek-v4 deepseek-v4-oracle
+.PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-check
 ifeq ($(COLI_V4_SUPPORTED),1)
 deepseek-v4:
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
+
+# The committed fixture is generated offline; this target needs only the host
+# Python standard library and the native V4 compiler toolchain.
+deepseek-v4-tiny-check:
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) deepseek-v4
+	$(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
 
 # Full-model oracle (not part of light `make check`). Requires MODEL=...
 # Example:
@@ -264,6 +273,8 @@ deepseek-v4:
 	@echo "deepseek-v4 is supported only on x86-64 Linux and Windows/MSYS2" >&2; exit 1
 deepseek-v4-oracle:
 	@echo "deepseek-v4-oracle is supported only on x86-64 Linux and Windows/MSYS2" >&2; exit 1
+deepseek-v4-tiny-check:
+	@echo "SKIP deepseek-v4-tiny-check: V4 runtime requires x86-64 Linux or Windows/MSYS2"
 endif
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
@@ -452,6 +463,7 @@ test-python:
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
 test: test-c test-python
+	$(MAKE) deepseek-v4-tiny-check
 
 # Local validation: one portable CPU build and dependency-free tests.
 check:
@@ -478,5 +490,5 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all glm deepseek-v4 deepseek-v4-oracle cuda-test cuda-bench cuda-dll \
+.PHONY: all glm deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-check cuda-test cuda-bench cuda-dll \
 	portable test-c test-python test check clean install uninstall bench
