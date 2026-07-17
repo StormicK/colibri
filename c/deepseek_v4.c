@@ -85,7 +85,7 @@ int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
     const int64_t experts = config->n_routed_experts;
     const int64_t moe = config->moe_intermediate_size;
     const int64_t hc = config->hc_mult;
-    const int64_t hc_params = 2 * hc * (hc - 1);
+    const int64_t hc_params = (2 + hc) * hc;
 
     ADD(add_1d(plan, COLI_ST_F32, heads, "attn.attn_sink", error, error_size));
     ADD(add_1d(plan, COLI_ST_BF16, head_dim, "attn.kv_norm.weight", error, error_size));
@@ -140,11 +140,11 @@ int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
     ADD(add_1d(plan, COLI_ST_F32, hc_params, "hc_attn_base", error, error_size));
     ADD(add_2d(plan, COLI_ST_F32, hc_params, hc * hidden,
                "hc_attn_fn", error, error_size));
-    ADD(add_1d(plan, COLI_ST_F32, hc - 1, "hc_attn_scale", error, error_size));
+    ADD(add_1d(plan, COLI_ST_F32, 3, "hc_attn_scale", error, error_size));
     ADD(add_1d(plan, COLI_ST_F32, hc_params, "hc_ffn_base", error, error_size));
     ADD(add_2d(plan, COLI_ST_F32, hc_params, hc * hidden,
                "hc_ffn_fn", error, error_size));
-    ADD(add_1d(plan, COLI_ST_F32, hc - 1, "hc_ffn_scale", error, error_size));
+    ADD(add_1d(plan, COLI_ST_F32, 3, "hc_ffn_scale", error, error_size));
     return 0;
 }
 
@@ -2129,8 +2129,7 @@ int coli_v4_compressor_create_with_options(
     char *error, size_t error_size) {
     if (!output || !weights || !config || !options || !options->prefix ||
         !options->prefix[0] || options->head_dimension <= 0 ||
-        (weights->plan.compression_ratio != 128 &&
-         weights->plan.compression_ratio != 4))
+        weights->plan.compression_ratio < 1)
         return set_error(error, error_size, "unsupported compressor ratio");
     if (strlen(options->prefix) >= sizeof(((ColiDeepSeekV4CompressorState *)0)->prefix))
         return set_error(error, error_size, "compressor prefix is too long");
@@ -3517,6 +3516,7 @@ int coli_v4_block_window_batch_ref(
         free(normalized); free(states); return -1;
     }
     int result = 0;
+    const char *phase = "attention hyper-connection";
     for (int item = 0; !result && item < batch; item++)
         result = normalized_hc_pre(
             reduced, posts + (size_t)item * hc,
@@ -3524,9 +3524,11 @@ int coli_v4_block_window_batch_ref(
             normalized + (size_t)item * d,
             inputs_hc + (size_t)item * hd,
             weights, config, "attn", "attn_norm.weight");
+    phase = "attention";
     if (!result) result = coli_v4_attention_window_batch_ref(
         branches, attention, weights, config, normalized,
         start_position, batch, error, error_size);
+    if (!result) phase = "attention post / FFN hyper-connection";
     for (int item = 0; !result && item < batch; item++) {
         float *state = states + (size_t)item * hd;
         result = coli_v4_hc_post(
@@ -3535,9 +3537,11 @@ int coli_v4_block_window_batch_ref(
             posts + (size_t)item * hc,
             combs + (size_t)item * hc * hc, hc, d);
         if (!result) coli_bf16_round_array(state, hd);
+        if (!result) phase = "FFN hyper-connection";
         if (!result) result = normalized_hc_pre(
             reduced, ffn_post, ffn_comb, ffn_normalized, state,
             weights, config, "ffn", "ffn_norm.weight");
+        if (!result) phase = "MoE";
         if (!result) result = moe_token_pipeline(
             ffn_branch, weights, config, experts,
             ffn_normalized, tokens[item]);
@@ -3550,7 +3554,9 @@ int coli_v4_block_window_batch_ref(
     free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
     free(reduced); free(combs); free(posts); free(branches);
     free(normalized); free(states);
-    return result ? set_error(error, error_size, "hybrid batched block failed") : 0;
+    if (!result) return 0;
+    if (error && error_size && error[0]) return -1;
+    return set_error(error, error_size, "hybrid batched block failed in %s", phase);
 }
 #endif /* COLI_V4_UNIT_BLOCK_HYBRID */
 
@@ -3627,8 +3633,7 @@ int coli_v4_compressor_create_with_options(
     char *error, size_t error_size) {
     if (!output || !weights || !config || !options || !options->prefix ||
         !options->prefix[0] || options->head_dimension <= 0 ||
-        (weights->plan.compression_ratio != 128 &&
-         weights->plan.compression_ratio != 4))
+        weights->plan.compression_ratio < 1)
         return set_error(error, error_size, "unsupported compressor ratio");
     if (strlen(options->prefix) >= sizeof(((ColiDeepSeekV4CompressorState *)0)->prefix))
         return set_error(error, error_size, "compressor prefix is too long");
@@ -7440,8 +7445,9 @@ int main(int argc, char **argv) {
         }
         int greedy_matched = 0;
         int continue_count = full_count - prompt_count;
-        int compare = got < greedy_limit ? got : greedy_limit;
-        if (compare > continue_count) compare = continue_count;
+        int expected_count = continue_count < greedy_limit
+            ? continue_count : greedy_limit;
+        int compare = got < expected_count ? got : expected_count;
         for (int i = 0; i < compare; i++) {
             int expected = full_ids[prompt_count + i];
             if (generated[i] == expected) greedy_matched++;
@@ -7450,11 +7456,19 @@ int main(int argc, char **argv) {
                         "[ORACLE] greedy mismatch i=%d expected=%d got=%d\n",
                         i, expected, generated[i]);
         }
-        printf("GREEDY C vs oracle: %d/%d tokens\n", greedy_matched, compare);
+        int greedy_exact_length = got == expected_count;
+        if (!greedy_exact_length)
+            fprintf(stderr,
+                    "[ORACLE] greedy length mismatch expected=%d got=%d "
+                    "reference=%d requested=%d\n",
+                    expected_count, got, continue_count, greedy_limit);
+        printf("GREEDY C vs oracle: %d/%d tokens\n",
+               greedy_matched, expected_count);
         free(full_ids); free(tf_pred);
         full_ids = NULL; tf_pred = NULL;
         (void)process_started;
-        result = (tf_matched == tf_limit && greedy_matched == compare) ? 0 : 1;
+        result = (tf_matched == tf_limit && greedy_exact_length &&
+                  greedy_matched == expected_count) ? 0 : 1;
         goto cleanup;
     }
 
@@ -8358,7 +8372,7 @@ int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
     const int64_t experts = config->n_routed_experts;
     const int64_t moe = config->moe_intermediate_size;
     const int64_t hc = config->hc_mult;
-    const int64_t hc_params = 2 * hc * (hc - 1);
+    const int64_t hc_params = (2 + hc) * hc;
 
     ADD(add_1d(plan, COLI_ST_F32, heads, "attn.attn_sink", error, error_size));
     ADD(add_1d(plan, COLI_ST_BF16, head_dim, "attn.kv_norm.weight", error, error_size));
@@ -8413,11 +8427,11 @@ int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
     ADD(add_1d(plan, COLI_ST_F32, hc_params, "hc_attn_base", error, error_size));
     ADD(add_2d(plan, COLI_ST_F32, hc_params, hc * hidden,
                "hc_attn_fn", error, error_size));
-    ADD(add_1d(plan, COLI_ST_F32, hc - 1, "hc_attn_scale", error, error_size));
+    ADD(add_1d(plan, COLI_ST_F32, 3, "hc_attn_scale", error, error_size));
     ADD(add_1d(plan, COLI_ST_F32, hc_params, "hc_ffn_base", error, error_size));
     ADD(add_2d(plan, COLI_ST_F32, hc_params, hc * hidden,
                "hc_ffn_fn", error, error_size));
-    ADD(add_1d(plan, COLI_ST_F32, hc - 1, "hc_ffn_scale", error, error_size));
+    ADD(add_1d(plan, COLI_ST_F32, 3, "hc_ffn_scale", error, error_size));
     return 0;
 }
 

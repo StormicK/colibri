@@ -113,11 +113,12 @@ static int ceil_log2_positive(float value) {
 int coli_fp8_activation_qdq_ref(float *output, uint8_t *scales,
                                 const float *input, size_t length,
                                 size_t block_size) {
-    if (!output || !scales || !input || !block_size || length % block_size)
+    if (!output || !scales || !input || !length || !block_size)
         return -1;
     for (size_t base = 0; base < length; base += block_size) {
+        size_t count = length - base < block_size ? length - base : block_size;
         float maximum = 0.0f;
-        for (size_t i = 0; i < block_size; i++)
+        for (size_t i = 0; i < count; i++)
             maximum = fmaxf(maximum, fabsf(input[base + i]));
         maximum = fmaxf(maximum, 1e-4f);
         int scale_exponent = ceil_log2_positive(maximum / 448.0f);
@@ -126,7 +127,7 @@ int coli_fp8_activation_qdq_ref(float *output, uint8_t *scales,
         uint8_t encoded_scale = (uint8_t)(scale_exponent + 127);
         float scale = coli_e8m0_decode(encoded_scale);
         scales[base / block_size] = encoded_scale;
-        for (size_t i = 0; i < block_size; i++) {
+        for (size_t i = 0; i < count; i++) {
             float normalized = fmaxf(-448.0f,
                                      fminf(448.0f, input[base + i] / scale));
             output[base + i] = coli_e4m3fn_decode(
@@ -139,11 +140,12 @@ int coli_fp8_activation_qdq_ref(float *output, uint8_t *scales,
 int coli_fp4_activation_qdq_ref(float *output, uint8_t *scales,
                                 const float *input, size_t length,
                                 size_t block_size) {
-    if (!output || !scales || !input || !block_size || length % block_size)
+    if (!output || !scales || !input || !length || !block_size)
         return -1;
     for (size_t base = 0; base < length; base += block_size) {
+        size_t count = length - base < block_size ? length - base : block_size;
         float maximum = 0.0f;
-        for (size_t i = 0; i < block_size; i++)
+        for (size_t i = 0; i < count; i++)
             maximum = fmaxf(maximum, fabsf(input[base + i]));
         maximum = fmaxf(maximum, 6.0f * ldexpf(1.0f, -126));
         int exponent = ceil_log2_positive(maximum / 6.0f);
@@ -151,7 +153,7 @@ int coli_fp4_activation_qdq_ref(float *output, uint8_t *scales,
         if (exponent > 127) exponent = 127;
         scales[base / block_size] = (uint8_t)(exponent + 127);
         float scale = coli_e8m0_decode(scales[base / block_size]);
-        for (size_t i = 0; i < block_size; i++) {
+        for (size_t i = 0; i < count; i++) {
             float value = fmaxf(-6.0f, fminf(6.0f, input[base + i] / scale));
             int best = 0;
             float distance = fabsf(value - coli_e2m1_decode(0));

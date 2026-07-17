@@ -50,6 +50,21 @@ int main(void) {
         fp4_scale != 125) return 1; /* 2^-2 */
     for (int i = 0; i < 32; i++)
         if (!close_enough(fp4_qdq[i], 1.0f)) return 1;
+
+    /* Tiny valid heads can end in a partial activation block. */
+    float partial_input[20], partial_fp8[20], partial_fp4[20];
+    uint8_t partial_fp8_scale, partial_fp4_scale;
+    for (int i = 0; i < 20; i++) partial_input[i] = 1.0f;
+    if (coli_fp8_activation_qdq_ref(partial_fp8, &partial_fp8_scale,
+                                    partial_input, 20, 64) != 0 ||
+        partial_fp8_scale != 119 ||
+        coli_fp4_activation_qdq_ref(partial_fp4, &partial_fp4_scale,
+                                    partial_input, 20, 32) != 0 ||
+        partial_fp4_scale != 125) return 1;
+    for (int i = 0; i < 20; i++)
+        if (!close_enough(partial_fp8[i], 1.0f) ||
+            !close_enough(partial_fp4[i], 1.0f)) return 1;
+
     float hadamard[4] = {1.0f, 2.0f, 3.0f, 4.0f};
     static const float hadamard_expected[4] = {5.0f, -1.0f, -2.0f, 0.0f};
     if (coli_hadamard_bf16_ref(hadamard, 4) != 0) return 1;

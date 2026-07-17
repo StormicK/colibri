@@ -73,6 +73,8 @@ c/tests/deepseek_v4_oracle.tmp_ids.json
 
 # pesi modello / artefatti di run
 *.safetensors
+!c/deepseek_v4_tiny/model.safetensors
+!c/deepseek_v4_tiny/dspark/model.safetensors
 stats*.txt
 *.log
 
