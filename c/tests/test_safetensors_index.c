@@ -131,7 +131,8 @@ int main(void) {
         {"rank-too-large", "{\"w\":{\"dtype\":\"U8\",\"shape\":[1,1,1,1,1,1,1,1,1],\"data_offsets\":[0,1]}}"},
     };
 
-    char directory[] = "/tmp/colibri-st-XXXXXX";
+    /* Native MinGW binaries do not resolve the MSYS /tmp mount. */
+    char directory[] = "colibri-st-XXXXXX";
     char path[256];
     int failures = 0;
     if (!mkdtemp(directory)) return 1;

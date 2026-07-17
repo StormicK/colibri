@@ -119,7 +119,8 @@ static int write_tokenizer(const char *directory) {
 }
 
 static int make_fixture(char *directory, size_t directory_size) {
-    char template[] = "/tmp/colibri-v4-own-XXXXXX";
+    /* Native MinGW binaries do not resolve the MSYS /tmp mount. */
+    char template[] = "colibri-v4-own-XXXXXX";
     if (!mkdtemp(template)) return -1;
     if (strlen(template) + 1 > directory_size) return -1;
     memcpy(directory, template, strlen(template) + 1);

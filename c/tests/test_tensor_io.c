@@ -42,7 +42,8 @@ static int write_fixture(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    char directory[] = "/tmp/colibri-tensor-io-XXXXXX";
+    /* Native MinGW binaries do not resolve the MSYS /tmp mount. */
+    char directory[] = "colibri-tensor-io-XXXXXX";
     char path[256], error[256];
     if (!mkdtemp(directory)) return 1;
     snprintf(path, sizeof(path), "%s/model.safetensors", directory);

@@ -269,7 +269,8 @@ static int write_fixture(const char *path) {
 }
 
 static int test_expert_store(void) {
-    char directory[] = "/tmp/colibri-v4-store-XXXXXX";
+    /* Native MinGW binaries do not resolve the MSYS /tmp mount. */
+    char directory[] = "colibri-v4-store-XXXXXX";
     char path[256], error[256];
     if (!mkdtemp(directory)) { perror("mkdtemp"); return 1; }
     snprintf(path, sizeof(path), "%s/model.safetensors", directory);
