@@ -27,6 +27,59 @@ tiering—end-to-end generation that passes smoke tests.
   model directory strings; destroy every session before `coli_v4_engine_destroy`.
   Index and ExpertStore accessors stay internal (`deepseek_v4_internal.h`).
 
+## Getting the model (no colibri-specific conversion step)
+
+Unlike `hy3`/GLM, which need a colibri-specific INT4 conversion pass
+(`tools/convert_hy3.py`, `tools/convert_fp8_to_int4.py`), the V4 engine reads
+the **original** Hugging Face checkpoint directly — dense tensors as shipped
+(FP8 E4M3 + UE8M0 block scales) and routed experts as shipped (packed FP4
+`float4_e2m1fn_x2`). There is nothing to pre-process or re-pack before
+pointing colibri at the checkpoint directory.
+
+1. **Download the checkpoint.** Get the full
+   `deepseek-ai/DeepSeek-V4-Flash-DSpark` repository (~167 GB: `config.json`,
+   `generation_config.json`, `model-*-of-00048.safetensors`, tokenizer files).
+   Put it on the fastest local NVMe you have — experts are streamed from disk
+   during decode, so storage bandwidth directly drives tok/s.
+
+   ```bash
+   pip install -U "huggingface_hub[cli]"
+   huggingface-cli download deepseek-ai/DeepSeek-V4-Flash-DSpark \
+     --local-dir /path/to/DeepSeek-V4-Flash-DSpark
+   ```
+
+   (`hf_transfer`/`hf_xet` speed this up a lot on a fast line; see
+   `huggingface_hub` docs. A ModelScope mirror may also exist if HF is slow
+   for you — see `c/download_fp8.py` for the dual-source pattern colibri
+   already uses for GLM.)
+
+2. **Ignore the model card's own `inference/README.md`.** That folder's
+   `convert.py` + `generate.py` are DeepSeek's reference **multi-GPU
+   torch** runtime: `convert.py` re-shards the checkpoint into a
+   model-parallel on-disk format for `torchrun`. Colibri's `deepseek_v4`
+   engine is an independent CPU implementation that never calls that script
+   and does not use its output format — running it is unnecessary and the
+   two on-disk layouts are not interchangeable.
+
+3. **Point colibri straight at the downloaded directory.** DSpark's
+   speculative-decode weights ship inside this same `-DSpark` repo (per the
+   model card: "the same checkpoint with an additional speculative decoding
+   module attached"), so `--draft-model` is not required — it defaults to
+   the main `--model` directory. Only pass `--draft-model` if you keep the
+   draft weights in a separate directory yourself (as the committed tiny
+   test fixture does, for CI convenience).
+
+   ```powershell
+   cd colibri
+   python ./c/v4 run --model D:/ai/DeepSeek-V4-Flash-DSpark --ram 32 `
+     --stop-sentence "What is the capital of France?"
+   ```
+
+4. **Validate before trusting a new checkpoint/build.** Run the
+   dependency-free tiny oracle first (`make deepseek-v4-tiny-check`, no
+   download required), then the full-checkpoint oracle against your real
+   download — see "Full-checkpoint oracle validation" below.
+
 ## Model snapshot
 
 Typical DeepSeek-V4-Flash-DSpark shape (from checkpoint metadata):
