@@ -230,7 +230,7 @@ ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
-TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE)
+TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) tests/test_native_quant_avx2$(EXE)
 endif
 
 # Windows CUDA/HIP DLL path: host links the loader, NOT cudart/amdhip64.
@@ -524,6 +524,13 @@ tests/test_tensor_io$(EXE): tests/test_tensor_io.c tensor_io.c tensor_io.h nativ
 		-o $@ $(LDFLAGS)
 
 ifeq ($(COLI_V4_SUPPORTED),1)
+tests/test_native_quant_avx2$(EXE): tests/test_native_quant_avx2.c \
+		native_quant_avx2.c native_quant_parallel.c native_quant_dual.c \
+		native_quant_batch_avx512.c native_quant_batch.c native_quant.c \
+		native_quant.h tensor.h
+	$(CC) $(CFLAGS) native_quant_avx2.c native_quant_batch_avx512.c $< \
+		-o $@ $(LDFLAGS)
+
 # Merged DeepSeek V4 unit tests — objects from amalgamated units (test-only + deps).
 include Makefile.deepseek-v4.units
 V4_TEST_LINK_OBJS = \

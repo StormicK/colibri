@@ -7,8 +7,10 @@
 #include "native_quant_batch.c"
 #undef coli_fp4_matmul_batch_ref
 
-int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
-                              const float *inputs, int batch) {
+/* Exported as the float fallback; coli_fp4_matmul_batch_ref itself now lives
+ * in native_quant_avx2.c (int8 dot) and calls back into this kernel. */
+int coli_fp4_matmul_batch_float_v4(float *outputs, const ColiTensorView *weight,
+                                   const float *inputs, int batch) {
     enum { BATCH_MAX = 64, ROW_TILE = 4, SIMD_WIDTH = 8 };
     if (!outputs || !weight || !inputs || batch < 1 || batch > BATCH_MAX ||
         weight->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
@@ -90,8 +92,10 @@ int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
 
 #undef coli_fp8_matmul_batch_ref
 
-int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
-                              const float *inputs, int batch) {
+/* Exported as the float fallback (AVX-512 gather or scalar baseline);
+ * coli_fp8_matmul_batch_ref itself now lives in native_quant_avx2.c. */
+int coli_fp8_matmul_batch_float_v6(float *outputs, const ColiTensorView *weight,
+                                   const float *inputs, int batch) {
 #ifndef __AVX512F__
     return coli_fp8_matmul_batch_baseline_v6(outputs, weight, inputs, batch);
 #else

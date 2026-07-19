@@ -5995,6 +5995,10 @@ static int final_hidden(float *output, const float *state,
     return 0;
 }
 
+/* deepseek_v4_dspark.h declares this later in the amalgam order. */
+void coli_v4_head_row_dot(float *sums, const uint16_t *weight,
+                          const float *hidden, int d, int batch);
+
 static int head_argmax(ColiV4Engine *engine, const float *hidden,
                        const ColiSafetensorsIndex *index,
                        const ColiDeepSeekV4Config *config,
@@ -6010,6 +6014,29 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
     }
     int winner = -1;
     float maximum = -FLT_MAX;
+    /* Resident head: dot the cached BF16 rows in place - no memcpy through the
+     * read path, one parallel pass over the whole vocabulary, then a serial
+     * argmax scan that keeps the original first-max-wins order. */
+    const uint16_t *resident = (const uint16_t *)coli_v4_head_cache_data(
+        engine, head->shard, head->offset, (size_t)head->nbytes);
+    float *all_scores = resident
+        ? malloc((size_t)vocab * sizeof(*all_scores)) : NULL;
+    if (resident && all_scores) {
+        #pragma omp parallel for schedule(static)
+        for (int row = 0; row < vocab; row++)
+            coli_v4_head_row_dot(&all_scores[row],
+                                 resident + (size_t)row * d, hidden, d, 1);
+        for (int row = 0; row < vocab; row++)
+            if (all_scores[row] > maximum) {
+                maximum = all_scores[row];
+                winner = row;
+            }
+        free(all_scores); free(scores); free(raw);
+        *best_token = winner;
+        *best_logit = maximum;
+        return winner < 0 ? -1 : 0;
+    }
+    free(all_scores);
     for (int start = 0; start < vocab; start += ROWS) {
         int rows = vocab - start < ROWS ? vocab - start : ROWS;
         size_t bytes = (size_t)rows * d * sizeof(*raw);
@@ -6022,11 +6049,8 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
         }
         #pragma omp parallel for
         for (int row = 0; row < rows; row++) {
-            float sum = 0.0f;
             const uint16_t *weight = raw + (size_t)row * d;
-            for (int i = 0; i < d; i++)
-                sum += coli_bf16_decode(weight[i]) * hidden[i];
-            scores[row] = sum;
+            coli_v4_head_row_dot(&scores[row], weight, hidden, d, 1);
         }
         for (int row = 0; row < rows; row++)
             if (scores[row] > maximum) {
