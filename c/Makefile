@@ -202,7 +202,7 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -276,7 +276,21 @@ all: glm$(EXE) hy3$(EXE)
 glm: glm$(EXE)
 hy3: hy3$(EXE)
 
-glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ)
+# Config stamp: make only tracks file timestamps, not flag changes. Without this,
+# `make glm.exe CUDA_DLL=1` after a prior CPU-only build reports "up to date" and
+# silently keeps the CPU-only binary (no CUDA loader) — a build that looks like it
+# worked but isn't. We record the build-affecting flags in .build-config and rewrite
+# it ONLY when they change (evaluated here at parse time, so the file's timestamp
+# moves exactly when the config moves). glm.exe and the CUDA/loader objects depend
+# on it, so they relink on a config change and stay put otherwise. (#306)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)
+BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
+ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
+$(shell printf '%s' '$(BUILD_CONFIG)' > .build-config)
+endif
+.build-config: ;
+
+glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) -o glm$(EXE) $(LDFLAGS)
 
 # Hy3 (hy_v3): same CFLAGS/LDFLAGS/CUDA_OBJ/METAL_OBJ wiring as glm, so
@@ -285,7 +299,7 @@ hy3$(EXE): hy3.c st.h json.h tok.h tok_unicode.h compat.h tier.h $(CUDA_OBJ) $(M
 	$(CC) $(CFLAGS) hy3.c $(CUDA_OBJ) $(METAL_OBJ) -o hy3$(EXE) $(LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
-backend_loader.o: backend_loader.c backend_cuda.h compat.h
+backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 	$(CC) $(CFLAGS) -c backend_loader.c -o $@
 
 # Windows CUDA DLL: compile backend_cuda.cu with nvcc (+MSVC cl.exe as host
@@ -294,9 +308,9 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
 cuda-dll: backend_cuda.cu backend_cuda.h
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
+	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
 		backend_cuda.cu -o coli_cuda.dll
 
@@ -315,9 +329,9 @@ hip-dll: backend_cuda.cu backend_cuda.h
 		-L"$(ROCM_HOME)/lib" -lamdhip64 \
 		backend_cuda.cu -o coli_cuda.dll
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h
-	@command -v $(GPUCC) >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
-	$(GPUCC) $(GPUFLAGS) -c backend_cuda.cu -o $@
+backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-config
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
@@ -327,8 +341,8 @@ metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
 	./backend_metal_test
 
 cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu
-	@command -v $(GPUCC) >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
-	$(GPUCC) $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
 
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
@@ -338,11 +352,11 @@ hip-test:
 # CI: compile the backend and its test binary WITHOUT executing them (for
 # runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
 gpu-compile: backend_cuda.o
-	$(GPUCC) $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 
 cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tensor_core.cu
-	@command -v $(GPUCC) >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
-	$(GPUCC) $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
 	./backend_cuda_bench$(EXE)
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
@@ -372,6 +386,9 @@ iobench$(EXE): iobench.c compat.h
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
+	$(CC) $(CFLAGS) -DST_PREAD_CHUNK=7 $< -o $@ $(LDFLAGS)
+
 tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -390,13 +407,41 @@ tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 tests/test_idot$(EXE): tests/test_idot.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_stops$(EXE): tests/test_stops.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_topp$(EXE): tests/test_topp.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
+# gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp
+tests/bench_topp$(EXE): tests/bench_topp.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_sample_nan$(EXE): tests/test_sample_nan.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_logit_nan$(EXE): tests/test_logit_nan.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_dsa_select$(EXE): tests/test_dsa_select.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_dsa_select is a microbenchmark (old qsort vs new quickselect partial-select, #356),
+# NOT a test gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_dsa_select
+tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_uring$(EXE): tests/test_uring.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h

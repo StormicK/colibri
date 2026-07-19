@@ -18,27 +18,34 @@ def _check(identifier, status, summary, **details):
 
 
 def cuda_linkage(engine_path):
-    """Return CUDA/HIP linkage state without loading the executable or GPU runtime."""
-    engine_path = Path(engine_path)
-    if not engine_path.is_file():
+    """Return CUDA linkage state without loading the executable or CUDA runtime."""
+    engine = Path(engine_path)
+    if not engine.is_file():
         return {"linked": False, "missing": False}
+    if os.name == "posix":
+        try:
+            result = subprocess.run(["ldd", str(engine)], capture_output=True, text=True,
+                                    timeout=3, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return {"linked": False, "missing": False}
+        lines = [line for line in result.stdout.splitlines() if "libcudart" in line]
+        return {"linked": any("not found" not in line for line in lines),
+                "missing": any("not found" in line for line in lines)}
     if sys.platform == "win32":
-        # Windows never links CUDA/HIP directly (MSVC-ABI mismatch with the
-        # MinGW-built engine): backend_loader.c loads coli_cuda.dll (CUDA_DLL=1
-        # or HIP_DLL=1) at runtime instead, always under that filename next to
-        # the engine binary. There's no `ldd` here, so check for the DLL.
-        has_dll = (engine_path.parent / "coli_cuda.dll").is_file()
-        return {"linked": has_dll, "missing": not has_dll}
-    if os.name != "posix":
-        return {"linked": False, "missing": False}
-    try:
-        result = subprocess.run(["ldd", str(engine_path)], capture_output=True, text=True,
-                                timeout=3, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return {"linked": False, "missing": False}
-    lines = [line for line in result.stdout.splitlines() if "libcudart" in line]
-    return {"linked": any("not found" not in line for line in lines),
-            "missing": any("not found" in line for line in lines)}
+        # Windows CUDA_DLL=1 builds never link libcudart directly: glm.exe loads
+        # coli_cuda.dll at runtime via LoadLibrary (backend_loader.c), so there's no
+        # import-table entry for ldd/dumpbin to see. Detect the COLI_CUDA build via a
+        # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
+        # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
+        try:
+            built = b"[CUDA] mode: routed experts" in engine.read_bytes()
+        except OSError:
+            return {"linked": False, "missing": False}
+        if not built:
+            return {"linked": False, "missing": False}
+        dll_present = (engine.parent / "coli_cuda.dll").is_file()
+        return {"linked": dll_present, "missing": not dll_present}
+    return {"linked": False, "missing": False}
 
 
 def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
