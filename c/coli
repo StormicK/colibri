@@ -651,7 +651,6 @@ def kv_resume_notice(model_dir):
     except (OSError, struct.error): pass
 
 def cmd_chat(a):
-def cmd_chat(a):
     engine=engine_for(a.model)
     # ATTACH: a running `coli serve` beats a private engine every time — the load
     # (34-136 s) and the cache warmth survive between sessions. Explicit --attach
@@ -802,7 +801,6 @@ def cmd_chat(a):
 
 def serve_pidfile(port): return os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.pid")
 
-def cmd_serve(a):
 def cmd_serve(a):
     engine=engine_for(a.model)
     need_model(a.model, engine)
