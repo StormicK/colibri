@@ -1,6 +1,6 @@
 /* Tokenizer GLM-5.2 in C puro (byte-level BPE stile cl100k / tiktoken).
  * Replica fedele di tokenizer.json:
- *   - model.type = BPE, ignore_merges=true, byte_fallback=false
+ *   - model.type = BPE, byte_fallback=false
  *   - pre_tokenizer: regex Split (pattern cl100k) + ByteLevel(add_prefix_space=false)
  *   - merges con rank = ordine nella lista; \p{L}/\p{N}/\s da tok_unicode.h
  *   - added_tokens (speciali e non) trattati come atomici in encode/decode
@@ -8,6 +8,7 @@
  *   tok_load(&T, "tokenizer.json");
  *   int n = tok_encode(&T, text, len, out_ids, max);
  *   int m = tok_decode(&T, ids, n, out_buf, max);
+ *   tok_free(&T);   // optional; V4 session destroy uses this
  */
 #ifndef TOK_H
 #define TOK_H
@@ -48,6 +49,7 @@ typedef struct {
                                                  * id_added, che copre anche <think>/<tool_call> ("special"
                                                  * false), i quali sono testo vero e vanno renderizzati. */
     Special *sp; int nsp;                       /* added tokens, ordinati per lunghezza decrescente */
+    jval *json_root;     /* owns vocab/special strings borrowed below */
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
 } Tok;
@@ -93,11 +95,39 @@ static char *tk_read_file(const char *path, long *out_n){
 }
 static int cmp_sp_len(const void *a, const void *b){ return ((const Special*)b)->len - ((const Special*)a)->len; }
 
+static void hm_free(hmap *m, int free_keys){
+    if(!m || !m->e) return;
+    if(free_keys){
+        for(int i=0;i<m->cap;i++)
+            if(m->e[i].used) free((void *)m->e[i].k);
+    }
+    free(m->e);
+    m->e=NULL; m->cap=0;
+}
+
+/* Release all Tok allocations. vocab/special/id2str strings are borrowed from
+ * json_root; merge keys are independently malloc'd. */
+static void tok_free(Tok *T){
+    if(!T) return;
+    /* merges keys are tok_load mallocs. */
+    hm_free(&T->merges, 1);
+    /* vocab keys belong to json_root; do not free them individually. */
+    hm_free(&T->vocab, 0);
+    free(T->sp);          /* sp[i].str borrows json_root */
+    free(T->id2str);
+    free(T->id_added);
+    json_free(T->json_root);
+    memset(T,0,sizeof(*T));
+}
+
 static void tok_load(Tok *T, const char *path){
     memset(T,0,sizeof(*T));
     tk_build_bytemap(T);
     long fn; char *buf=tk_read_file(path,&fn);
     char *arena=NULL; jval *root=json_parse(buf,&arena);
+    free(buf);
+    /* arena is always NULL with the current parser (j_dup allocates each string). */
+    (void)arena;
     jval *model=json_get(root,"model");
     jval *vocab=json_get(model,"vocab");
     jval *merges=json_get(model,"merges");
@@ -113,7 +143,7 @@ static void tok_load(Tok *T, const char *path){
     T->id_added=calloc(T->n_ids,sizeof(int));
     T->id_special=calloc(T->n_ids,sizeof(int));
 
-    /* vocab: stringa -> id  (capacita' potenza di 2, ~2-3x) */
+    /* vocab: stringa -> id  (capacita' potenza di 2, ~2-3x); borrow JSON keys. */
     int vc=1; while(vc < vocab->len*2) vc<<=1;
     hm_init(&T->vocab, vc);
     for(int i=0;i<vocab->len;i++){
@@ -121,17 +151,25 @@ static void tok_load(Tok *T, const char *path){
         hm_put(&T->vocab, k, (int)strlen(k), id);
         T->id2str[id]=(char*)k;
     }
-    /* merges: "left\0right" -> rank=i */
+    /* merges: HF accepts either [left,right] pairs or "left right" strings.
+     * Internally both become "left\0right" -> rank=i. */
     int mc=1; while(mc < merges->len*2) mc<<=1;
     hm_init(&T->merges, mc);
     for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
-        const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
-        int ll=(int)strlen(l), rl=(int)strlen(r);
+        const char *l=NULL, *r=NULL; int ll=0, rl=0;
+        if(pr->t==J_ARR && pr->len==2 && pr->kids[0]->t==J_STR && pr->kids[1]->t==J_STR){
+            l=pr->kids[0]->str; r=pr->kids[1]->str;
+            ll=(int)strlen(l); rl=(int)strlen(r);
+        }else if(pr->t==J_STR){
+            const char *separator=strchr(pr->str,' ');
+            if(!separator) continue;
+            l=pr->str; ll=(int)(separator-l); r=separator+1; rl=(int)strlen(r);
+        }else continue;
         char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
         hm_put(&T->merges, key, ll+1+rl, i);
     }
-    /* added tokens (speciali e non): atomici, output letterale */
+    /* added tokens (speciali e non): atomici, output letterale; borrow content. */
     if(added){
         T->nsp=added->len; T->sp=calloc(T->nsp,sizeof(Special));
         for(int i=0;i<added->len;i++){
@@ -144,8 +182,7 @@ static void tok_load(Tok *T, const char *path){
         }
         qsort(T->sp,T->nsp,sizeof(Special),cmp_sp_len);   /* match piu' lungo per primo */
     }
-    /* arena/buf restano allocati: le stringhe (j_dup) sono malloc indipendenti e ci servono vive */
-    (void)arena;
+    T->json_root=root;
 }
 
 /* ---------- BPE su un pezzo: byte grezzi [a,b) -> id appesi a out ---------- */

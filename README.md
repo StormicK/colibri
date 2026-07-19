@@ -196,6 +196,23 @@ and the optional API gateway.
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
 
+## DeepSeek V4
+
+The experimental CPU path for **DeepSeek V4 Flash + DSpark** uses native FP4
+experts, automatic RAM planning, and lossless speculative verification. It is
+supported on x86-64 Linux and Windows/MSYS2; other platforms keep validating
+the GLM engine through `make check`.
+
+```bash
+cd c
+make deepseek-v4
+python ./v4 run --model /path/to/DeepSeek-V4-Flash-DSpark --ram 32 \
+  --stop-sentence "What is the capital of France?"
+```
+
+See [docs/deepseek-v4.md](docs/deepseek-v4.md) for status, benchmarks,
+checkpoint validation, and the committed tiny independent oracle.
+
 ## Supporting the project
 
 colibrì started as a one-person project on a 12-core laptop with 25 GB of RAM;
@@ -223,7 +240,7 @@ c/
 └── tests/                dependency-free C and Python tests
 web/                      browser UI (pure OpenAI-API client)
 desktop/                  Tauri v2 desktop shell wrapping the web UI
-docs/                     reference docs, experiments, media
+docs/                     reference docs, experiments, media, DeepSeek V4
 ```
 
 The runtime path intentionally stays flat and readable: `glm.c` plus its small
