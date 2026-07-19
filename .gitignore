@@ -49,6 +49,9 @@ c/native_quant_parallel.o
 c/native_quant_dual.o
 c/native_quant_batch_avx512.o
 c/native_quant_fp4_rows16.o
+c/native_quant_avx2.o
+c/tests/test_native_quant_avx2
+c/tests/test_native_quant_avx2.exe
 c/build/ownership/
 c/tests/test_safetensors_index
 c/tests/test_safetensors_index.exe

@@ -21,7 +21,7 @@ FILES = [
     "deepseek_v4", "deepseek_v4.exe",
     "safetensors_index.o", "tensor_io.o",
     "native_quant.o", "native_quant_parallel.o", "native_quant_dual.o",
-    "native_quant_batch_avx512.o", "native_quant_fp4_rows16.o",
+    "native_quant_batch_avx512.o", "native_quant_fp4_rows16.o", "native_quant_avx2.o",
 ]
 # Test binaries match these patterns (.exe on Windows,
 # no extension on Unix) — never .c or .py source files.
