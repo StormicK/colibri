@@ -24,6 +24,13 @@ remains pure, dependency-free CPU. Both are refused on non-Linux with an early
 distributing or on machines with an unsupported iGPU visible to the runtime
 (and mask iGPUs at runtime with `HIP_VISIBLE_DEVICES=<ordinal>` on ROCm).
 
+The `hy3` engine (Tencent Hunyuan `hy_v3`, `c/hy3.c`) builds against the exact
+same `backend_cuda.cu`/`.h` and accepts identical flags — swap `glm` for `hy3`
+in any command above (e.g. `make -C c hy3 HIP=1 HIP_ARCH=gfx1201`). Its GQA
+attention is offloaded through `coli_cuda_gqa_attention()`, a dedicated causal
+softmax kernel added alongside the existing MLA `coli_cuda_attention_absorb()`
+— vendor-neutral by the same `backend_gpu_compat.h` rule below.
+
 ## Runtime configuration (identical for both vendors)
 
 - `COLI_CUDA=1` + `COLI_GPU=N` (or `COLI_GPUS=0,1,...`) — enable, select devices

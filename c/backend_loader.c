@@ -44,6 +44,9 @@ typedef int            (*fn_expert_group)(ColiCudaTensor *const *gates, ColiCuda
 typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, const float *q,
                                               const float *latent, const float *rope, int H, int Q,
                                               int R, int V, int K, int T, float attention_scale);
+typedef int            (*fn_gqa_attention)(float *ctx, const float *q, const float *k_cache,
+                                           const float *v_cache, int S, int H, int Hkv, int hd,
+                                           int st0, int pos_base, int max_t, int device);
 typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *weights,
                                            const float *scales, int fmt, int I, int O, int device);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
@@ -97,6 +100,7 @@ static struct {
     fn_expert_mlp      expert_mlp;
     fn_expert_group    expert_group;
     fn_attention_absorb attention_absorb;
+    fn_gqa_attention   gqa_attention;
     fn_tensor_upload   tensor_upload;
     fn_matmul          matmul;
     fn_tensor_free     tensor_free;
@@ -190,6 +194,7 @@ static int coli_cuda_load(void){
     RESOLVE(expert_mlp,     fn_expert_mlp)
     RESOLVE(expert_group,   fn_expert_group)
     RESOLVE(attention_absorb, fn_attention_absorb)
+    RESOLVE(gqa_attention,  fn_gqa_attention)
     RESOLVE(tensor_upload,  fn_tensor_upload)
     RESOLVE(matmul,         fn_matmul)
     RESOLVE(tensor_free,    fn_tensor_free)
@@ -288,6 +293,12 @@ int coli_cuda_attention_absorb(ColiCudaTensor *kv_b, float *ctx, const float *q,
                                int R, int V, int K, int T, float attention_scale){
     if(!g_cuda.available) return 0;
     return g_cuda.attention_absorb(kv_b, ctx, q, latent, rope, H, Q, R, V, K, T, attention_scale);
+}
+
+int coli_cuda_gqa_attention(float *ctx, const float *q, const float *k_cache, const float *v_cache,
+                           int S, int H, int Hkv, int hd, int st0, int pos_base, int max_t, int device){
+    if(!g_cuda.available) return 0;
+    return g_cuda.gqa_attention(ctx, q, k_cache, v_cache, S, H, Hkv, hd, st0, pos_base, max_t, device);
 }
 
 int coli_cuda_tensor_upload(ColiCudaTensor **tensor, const void *weights,

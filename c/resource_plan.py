@@ -144,6 +144,13 @@ def memory_available():
 
 
 def discover_gpus():
+    devices = _discover_nvidia_gpus()
+    if devices:
+        return devices
+    return _discover_amd_gpus()
+
+
+def _discover_nvidia_gpus():
     command = ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
                "--format=csv,noheader,nounits"]
     try:
@@ -163,6 +170,63 @@ def discover_gpus():
         devices.append({"index": index, "name": fields[1],
                         "total_bytes": total * 1024 * 1024,
                         "free_bytes": free * 1024 * 1024})
+    return devices
+
+
+def _hip_info_candidates():
+    """Where hipInfo[.exe] might live: PATH first, then the HIP SDK's own env
+    vars (HIP_PATH on Windows, ROCM_PATH on Linux — both set by the AMD
+    installers themselves, so no colibri-specific setup is required)."""
+    exe = "hipInfo.exe" if sys.platform == "win32" else "hipInfo"
+    yield exe
+    for var in ("HIP_PATH", "ROCM_PATH"):
+        root = os.environ.get(var)
+        if root:
+            yield os.path.join(root, "bin", exe)
+
+
+def _parse_hip_mem(text):
+    """'15.92 GB' -> bytes (hipInfo always prints one of B/KB/MB/GB/TB)."""
+    m = re.match(r"([0-9.]+)\s*([KMGT]?B)", text.strip())
+    if not m:
+        return None
+    value, unit = float(m.group(1)), m.group(2)
+    mult = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}[unit]
+    return int(value * mult)
+
+
+def _discover_amd_gpus():
+    """AMD/ROCm fallback: nvidia-smi obviously can't see a HIP-only GPU, so an
+    AMD-only machine (Windows or Linux) would otherwise always report 'no GPU'
+    even when HIP offload works fine. hipInfo ships with the HIP SDK and prints
+    one '----' separated block per device; unlike nvidia-smi it has no free-
+    memory field, so free_bytes == total_bytes (best-effort budget)."""
+    result = None
+    for candidate in _hip_info_candidates():
+        try:
+            result = subprocess.run([candidate], text=True, capture_output=True,
+                                    check=True, timeout=5)
+            break
+        except (OSError, subprocess.SubprocessError):
+            continue
+    if result is None:
+        return []
+    devices, index, name, total = [], None, None, None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("device#"):
+            if index is not None and name and total is not None:
+                devices.append({"index": index, "name": name,
+                                "total_bytes": total, "free_bytes": total})
+            parts = line.split(None, 1)
+            index = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+            name, total = None, None
+        elif line.startswith("Name:"):
+            name = line.split(":", 1)[1].strip()
+        elif line.startswith("totalGlobalMem:"):
+            total = _parse_hip_mem(line.split(":", 1)[1])
+    if index is not None and name and total is not None:
+        devices.append({"index": index, "name": name, "total_bytes": total, "free_bytes": total})
     return devices
 
 
@@ -235,14 +299,22 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         ram_budget = 8 * GB
     typical = info["typical_expert_bytes"]
     layers = int(cfg.get("num_hidden_layers") or 0) + 1
-    kv_bytes = layers * context * (int(cfg.get("kv_lora_rank") or 0) +
-                                   int(cfg.get("qk_rope_head_dim") or 0)) * 4
-    kv_buffer = context * int(cfg.get("num_attention_heads") or 0) * (
-        int(cfg.get("qk_nope_head_dim") or 0) + int(cfg.get("v_head_dim") or 0)) * 4
+    if cfg.get("model_type") == "hy_v3" or cfg.get("kv_lora_rank") is None:
+        # GQA (Hy3): dense float32 K/V cache, no MLA latent/rope split.
+        # Matches hy3.c's kv_pool_bytes(): nl * ctx * n_kv_heads * head_dim * 4 bytes * 2 (K+V).
+        n_kv_heads = int(cfg.get("num_key_value_heads") or cfg.get("num_attention_heads") or 0)
+        head_dim = int(cfg.get("head_dim") or 0)
+        kv_bytes = layers * context * n_kv_heads * head_dim * 4 * 2
+        kv_buffer = 0
+    else:
+        kv_bytes = layers * context * (int(cfg.get("kv_lora_rank") or 0) +
+                                       int(cfg.get("qk_rope_head_dim") or 0)) * 4
+        kv_buffer = context * int(cfg.get("num_attention_heads") or 0) * (
+            int(cfg.get("qk_nope_head_dim") or 0) + int(cfg.get("v_head_dim") or 0)) * 4
     runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * typical + kv_bytes + kv_buffer)
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
     per_cap = info["per_cap_bytes"]
-    configured_experts = int(cfg.get("n_routed_experts") or 0)
+    configured_experts = int(cfg.get("n_routed_experts") or cfg.get("num_experts") or 0)
     cap = int(cache_bytes // per_cap) if per_cap else 0
     if configured_experts:
         cap = min(cap, configured_experts)
@@ -326,6 +398,14 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     vram = plan["tiers"]["vram"]
     devices = [device["index"] for device in vram["devices"]]
     if not cuda_enabled or not devices or vram["budget_bytes"] <= 0:
+        # No GPU tier: drop any CUDA_EXPERT_GB/COLI_GPU(S) inherited from a
+        # previous session (e.g. exported in an earlier terminal for a manual
+        # run). Leaving them set with COLI_CUDA unset/off makes the engine
+        # hard-fail with "CUDA_EXPERT_GB requires COLI_CUDA=1" even though the
+        # user never asked for GPU offload in *this* invocation (#auto-tier).
+        if result.get("COLI_CUDA") != "1":
+            for key in ("CUDA_EXPERT_GB", "COLI_GPU", "COLI_GPUS", "CUDA_DENSE"):
+                result.pop(key, None)
         return result
     if result.get("COLI_CUDA", "1") == "0":
         return result
@@ -362,7 +442,7 @@ def format_plan(plan):
         lines.append(f"VRAM   {format_bytes(vram['budget_bytes'])} hot tier · "
                      f"~{vram['expert_capacity']} experts · {names}")
     else:
-        lines.append("VRAM   no NVIDIA device detected · CPU path")
+        lines.append("VRAM   no GPU detected · CPU path")
     lines.append(f"limit  {plan['expected_bottleneck']}")
     lines.extend(f"warn   {warning}" for warning in plan["warnings"])
     return "\n".join(lines)

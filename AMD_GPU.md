@@ -37,7 +37,12 @@ at runtime, no GPU required:
 - `json.h` — minimal JSON parser · `tier.h` — tier heat logic
 - `compat.h` — all Windows shims · `backend_gpu_compat.h` — all GPU-vendor shims (this port)
 - `backend_cuda.cu/.h` — the opt-in GPU expert backend (10-function opaque C ABI)
-- `coli` — Python CLI wrapper (spawns `glm`, sentinel-framed stdio, env-var config)
+- `hy3.c` — a second engine binary for Tencent Hunyuan Hy3 (`hy_v3`) checkpoints:
+  same streaming-expert architecture as `glm.c`, but GQA attention (with
+  per-head QK RMSNorm) instead of MLA, and a sigmoid+bias MoE router. Builds
+  and runs identically to `glm.c` — same Makefile targets, same `CUDA=1`/`HIP=1`
+  flags, same `coli` CLI (auto-selected from `config.json`'s `model_type`).
+- `coli` — Python CLI wrapper (spawns `glm` or `hy3`, sentinel-framed stdio, env-var config)
 - `openai_server.py` — stdlib-only OpenAI-compatible HTTP gateway
 
 ## 3. The memory hierarchy
@@ -104,6 +109,25 @@ HIP_VISIBLE_DEVICES=0 COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=12 CUDA_RELEASE_HOST
 ```
 
 (`HIP_VISIBLE_DEVICES=0` masks unsupported iGPUs from ROCm's enumeration.)
+
+### Hy3 (`hy_v3`) on the same ROCm build
+
+`hy3.c` reuses the exact same `backend_cuda.cu`/`.h` (via `backend_gpu_compat.h`),
+plus one addition — `coli_cuda_gqa_attention()` — a causal-softmax GQA attention
+kernel (head-sharing `nrep = H/Hkv`, per-block softmax reduction) offloading Hy3's
+attention the same way `coli_cuda_attention_absorb()` does for GLM's MLA attention.
+No separate build flags are needed: `HIP=1`/`CUDA=1` compile it in automatically.
+
+```sh
+cd c
+make hy3 HIP=1 HIP_ARCH=gfx1201    # Hy3 engine with the ROCm backend
+HIP_VISIBLE_DEVICES=0 COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=12 CUDA_RELEASE_HOST=1 \
+  ./coli chat --model /path/to/hy3_i4 --ram 40 --topp 0.7
+```
+
+`coli` auto-detects the engine from `config.json`'s `model_type` (`hy_v3` → `hy3`,
+otherwise `glm`) — no separate flag needed for `chat`/`run`/`serve`. For conversion,
+pass `--family hy3` (or a `--repo` containing "hy3") to `coli convert`.
 
 ## 6. Why the stock VRAM tier didn't help a disk-bound machine
 

@@ -77,6 +77,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *c
                                const float *latent,const float *rope,int H,int Q,
                                int R,int V,int K,int T,float attention_scale);
 
+/* GQA decode/prefill attention (Hy3): ctx[S,H,hd] from q[S,H,hd] and float K/V
+ * caches shaped [Hkv,max_t,hd]. st0 is the first valid KV position (partial
+ * KV during MTP), pos_base the query position of row 0. */
+COLI_CUDA_DLLEXPORT int coli_cuda_gqa_attention(float *ctx, const float *q,
+                            const float *k_cache, const float *v_cache,
+                            int S, int H, int Hkv, int hd, int st0, int pos_base,
+                            int max_t, int device);
+
 /* Causal MLA absorption for S contiguous rows from one sequence.  The KV
  * arrays contain T rows ending at the final query; query s attends T-S+s+1
  * rows.  One transfer and one launch replace S host round-trips. */

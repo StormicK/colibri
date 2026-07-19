@@ -361,6 +361,154 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
+# ---- Hy3 (hy_v3) chat rendering ------------------------------------------------------------
+# Special tokens use the fullwidth vertical bar U+FF5C, matching hy3.c's hy3_wrap()/hy3_effort()
+# byte-for-byte (this is the raw text sent through the "\x02PROMPT" pre-tokenized protocol,
+# so it must render into exactly the same string the engine's own hy3_wrap() would produce).
+HY3_BOS = "<\uff5chy_begin_of_sentence:opensource\uff5c>"
+HY3_REASONING = "<\uff5creasoning_mode:opensource\uff5c>"
+HY3_USER = "<\uff5chy_User:opensource\uff5c>"
+HY3_ASSISTANT = "<\uff5chy_Assistant:opensource\uff5c>"
+HY3_THINK_OPEN, HY3_THINK_CLOSE = "<think:opensource>", "</think:opensource>"
+
+
+def hy3_effort(think, reasoning_effort=None):
+    if not think:
+        return "reasoning_effort:no_think"
+    if reasoning_effort in ("high", "xhigh"):
+        return "reasoning_effort:high"
+    if reasoning_effort == "max":
+        return "reasoning_effort:max"
+    if reasoning_effort in ("low", "minimal"):
+        return "reasoning_effort:low"
+    if reasoning_effort == "medium":
+        return "reasoning_effort:medium"
+    return "reasoning_effort:high"
+
+
+def render_chat_hy3(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                    tool_choice=None):
+    """Render OpenAI-style messages into the Hunyuan (Hy3) chat format.
+
+    hy3.c's hy3_wrap() only wraps a single user turn; this extends the same special
+    tokens to multi-turn history (repeated User/Assistant blocks) since this port has
+    no access to Hy3's official multi-turn chat_template.jinja.
+
+    Tool calling reuses GLM-5.2's proven wire format verbatim -- the `<tools>` JSON
+    declaration block, and `<tool_call>{name}<arg_key>..</arg_key><arg_value>..</arg_value>
+    ..</tool_call>` for calls -- rather than inventing new syntax. parse_tool_calls() on
+    the response side is already engine-agnostic (plain regex over those markers), so this
+    is the only piece that needed porting. Hy3 has no dedicated system/observation role
+    token like GLM's <|system|>/<|observation|>, so the tool declaration folds into the
+    existing system-prefix-before-first-user-turn mechanism, and tool results fold into a
+    synthetic user turn (the closest analogue available without an official template)."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # the client forbade tools: do not offer them
+    system_text = []
+    if tools:
+        # Same declaration text as render_chat() (GLM), byte-for-byte: this is the only
+        # <tools>/<tool_call> syntax parse_tool_calls() understands, so reusing it verbatim
+        # gives the model its best chance at producing output the server can parse back.
+        decl = ["# Tools\n\nYou may call one or more functions to assist with the user "
+                "query.\n\nYou are provided with function signatures within <tools></tools> "
+                "XML tags:\n<tools>\n"]
+        for tool in tools:
+            fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+            clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
+            decl.append(json.dumps(clean, ensure_ascii=False) + "\n")
+        decl.append("</tools>\n\nFor each function call, output the function name and arguments "
+                    "within the following XML format:\n<tool_call>{function-name}"
+                    "<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>"
+                    "<arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>")
+        if forced:
+            decl.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
+        elif tool_choice == "required":
+            decl.append("\n\nYou must call one of the functions above. Do not answer directly.")
+        system_text.append("".join(decl))
+    turns = []
+    prev_tool = False
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role in ("system", "developer"):
+            system_text.append(content_text(message.get("content"), f"messages.{index}.content"))
+            prev_tool = False
+        elif role == "user":
+            turns.append(("user", content_text(message.get("content"), f"messages.{index}.content")))
+            prev_tool = False
+        elif role == "assistant":
+            # content may be null when the message is purely tool_calls
+            raw = message.get("content")
+            text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+            block = [text.strip()]
+            for tc in (message.get("tool_calls") or []):
+                fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+                args = fn.get("arguments", "{}")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                call = [BOX_START + (fn.get("name") or "")]
+                for key, value in (args or {}).items():
+                    call.append(f"<arg_key>{key}</arg_key><arg_value>"
+                                + (value if isinstance(value, str)
+                                   else json.dumps(value, ensure_ascii=False)) + "</arg_value>")
+                call.append(BOX_END)
+                block.append("".join(call))
+            turns.append(("assistant", "".join(block)))
+            prev_tool = False
+        elif role == "tool":
+            wrapped = TR_OPEN + content_text(message.get("content"), f"messages.{index}.content") + TR_CLOSE
+            if prev_tool and turns and turns[-1][0] == "user":
+                turns[-1] = ("user", turns[-1][1] + wrapped)   # one block per consecutive tool run
+            else:
+                turns.append(("user", wrapped))
+            prev_tool = True
+        else:
+            raise APIError(400, f"Unsupported message role: {role!r}.",
+                           f"messages.{index}.role", "unsupported_role")
+    if not turns or turns[0][0] != "user":
+        raise APIError(400, "The first message must have role 'user'.", "messages")
+    prefix = ("\n".join(system_text) + "\n") if system_text else ""
+    parts = [HY3_BOS, HY3_REASONING, hy3_effort(enable_thinking, reasoning_effort)]
+    first_user = True
+    for role, text in turns:
+        if role == "user":
+            parts.append(HY3_USER)
+            parts.append(prefix + text if first_user else text)
+            first_user = False
+        else:
+            parts.append(HY3_ASSISTANT)
+            parts.append(text)
+    parts.append(HY3_ASSISTANT)
+    parts.append(HY3_THINK_OPEN if enable_thinking else HY3_THINK_OPEN + HY3_THINK_CLOSE)
+    return "".join(parts)
+
+
+def model_family(model_dir):
+    """"hy_v3" for Hy3 checkpoints, "glm" otherwise (default)."""
+    try:
+        cfg = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "glm"
+    return "hy_v3" if cfg.get("model_type") == "hy_v3" else "glm"
+
+
+def default_model_id(model_dir):
+    return "hy3-colibri" if model_family(model_dir) == "hy_v3" else "glm-5.2-colibri"
+
+
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
@@ -653,7 +801,7 @@ class APIServer(ThreadingHTTPServer):
 
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
-                 kv_slots=1):
+                 kv_slots=1, model_family="glm"):
         super().__init__(address, APIHandler)
         self.engine = engine
         self.model_id = model_id
@@ -663,6 +811,7 @@ class APIServer(ThreadingHTTPServer):
         self.kv_slots = kv_slots
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
+        self.model_family = model_family
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -1044,8 +1193,12 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
-        prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                             body.get("tool_choice"))
+        if self.server.model_family == "hy_v3":
+            prompt = render_chat_hy3(body.get("messages"), enable_thinking, reasoning_effort, tools,
+                                     body.get("tool_choice"))
+        else:
+            prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
+                                 body.get("tool_choice"))
         self.generation(body, prompt, request_id, True)
 
     def completion(self, body, request_id):
@@ -1076,7 +1229,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     # Bind before starting the 744B engine. A stale/occupied port must fail in
     # milliseconds rather than loading hundreds of GB and leaking a child.
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
-                       max_queue, queue_timeout, kv_slots)
+                       max_queue, queue_timeout, kv_slots, model_family(model))
     runtime = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
@@ -1096,10 +1249,10 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
-    parser.add_argument("--engine", default=str(HERE / "glm"))
+    parser.add_argument("--engine", default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri"))
+    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID"))
     parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     parser.add_argument("--cors-origin", action="append", default=None,
                         help="allowed browser origin; repeat as needed (use '*' for any origin)")
@@ -1110,8 +1263,11 @@ def main():
                         default=float(os.environ.get("COLI_QUEUE_TIMEOUT", "300")))
     parser.add_argument("--kv-slots", type=int, default=int(os.environ.get("COLI_KV_SLOTS", "1")))
     args = parser.parse_args()
-    serve(args.model, args.host, args.port, args.model_id, args.api_key,
-          args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
+    family = model_family(args.model)
+    model_id = args.model_id or default_model_id(args.model)
+    engine = args.engine or str(HERE / ("hy3" if family == "hy_v3" else "glm"))
+    serve(args.model, args.host, args.port, model_id, args.api_key,
+          args.cap,args.max_tokens,engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots)
 
 

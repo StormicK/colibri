@@ -115,14 +115,21 @@ INSTALL    ?= install
 # CUDA=1 adds an opt-in backend for resident tensors. The default build remains
 # pure C and keeps the original zero-dependency runtime.
 #
-# Two paths:
-#   - Linux/macOS: CUDA=1 links backend_cuda.o directly (cudart via -l).
-#   - Windows:      CUDA_DLL=1 builds a standalone coli_cuda.dll (nvcc+MSVC),
-#                   then the host glm.exe loads it at runtime via backend_loader.c
+# Two paths per vendor:
+#   - Linux/macOS: CUDA=1 / HIP=1 link backend_cuda.o directly (cudart/amdhip64
+#                   via -l).
+#   - Windows:      CUDA_DLL=1 / HIP_DLL=1 build a standalone coli_cuda.dll
+#                   (nvcc+MSVC or hipcc+MSVC), then the host glm.exe/hy3.exe
+#                   loads it at runtime via backend_loader.c
 #                   (LoadLibrary/GetProcAddress). MinGW gcc cannot compile .cu
-#                   (nvcc needs cl.exe), and cross-linking MSVC objects into a
-#                   gcc binary is fragile — the DLL split keeps the toolchains
-#                   clean. See backend_loader.c and README "cuda-dll" below.
+#                   (nvcc needs cl.exe, and HIP-clang on Windows also targets
+#                   the MSVC ABI/linker), and cross-linking those objects into
+#                   a MinGW gcc binary is fragile — the DLL split keeps the
+#                   toolchains clean. Both DLLs export the identical
+#                   coli_cuda_* symbols under the same file name, so the host
+#                   binary doesn't know or care which vendor's DLL it loaded.
+#                   See backend_loader.c and the "cuda-dll"/"hip-dll" targets
+#                   below.
 CUDA      ?= 0
 CUDA_DLL  ?= 0
 ifneq ($(IS_WIN),)
@@ -158,9 +165,26 @@ endif
 # compiled unchanged through backend_gpu_compat.h (one source, two vendors,
 # like compat.h does for Windows). HIP_ARCH=native targets the GPU in this
 # machine; set an explicit arch (e.g. HIP_ARCH=gfx1201) when distributing.
+#
+# Windows uses the same DLL split as CUDA_DLL (see below): HIP_DLL=1 builds
+# coli_cuda.dll with the AMD HIP SDK for Windows (hipcc, clang-based, MSVC-ABI
+# output), and glm.exe/hy3.exe load it at runtime via backend_loader.c exactly
+# like the CUDA DLL — same exported coli_cuda_* symbols, same file name, so
+# the host binary never needs to know which vendor's DLL it loaded. Direct
+# linking (HIP=1) is Linux-only because hipcc there shares gcc's ELF ABI;
+# HIP-clang on Windows targets the MSVC ABI, which is exactly the mismatch
+# the DLL boundary exists to avoid (see backend_loader.c).
 HIP       ?= 0
+HIP_DLL   ?= 0
+ifneq ($(IS_WIN),)
+# AMD's HIP SDK for Windows installer sets the HIP_PATH env var system-wide
+# (e.g. C:\Program Files\AMD\ROCm\6.2\), mirroring CUDA_PATH above.
+ROCM_HOME ?= $(subst \,/,$(HIP_PATH))
+HIPCC     ?= hipcc
+else
 ROCM_HOME ?= /opt/rocm
 HIPCC     ?= $(ROCM_HOME)/bin/hipcc
+endif
 HIP_ARCH  ?= native
 HIPCCFLAGS ?= -O3 -std=c++17 -x hip --offload-arch=$(HIP_ARCH) -Wall -Wextra
 GPUCC      = $(NVCC)
@@ -183,11 +207,19 @@ ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 
-# Windows CUDA DLL path: host links the loader, NOT cudart.
+# Windows CUDA/HIP DLL path: host links the loader, NOT cudart/amdhip64.
 ifneq ($(IS_WIN),)
-ifeq ($(CUDA_DLL),1)
+ifeq ($(CUDA_DLL)$(HIP_DLL),11)
+$(error choose CUDA_DLL=1 or HIP_DLL=1, not both)
+endif
+ifneq (,$(filter 1,$(CUDA_DLL) $(HIP_DLL)))
 CFLAGS  += -DCOLI_CUDA
 CUDA_OBJ = backend_loader.o
+endif
+endif
+ifeq ($(HIP_DLL),1)
+ifeq (,$(IS_WIN))
+$(error HIP_DLL=1 is supported only on Windows (use HIP=1 on Linux))
 endif
 endif
 
@@ -209,6 +241,10 @@ CUDA_OBJ  = backend_cuda.o
 endif
 
 ifeq ($(HIP),1)
+ifneq ($(IS_WIN),)
+# On Windows use HIP_DLL=1 (runtime DLL), not HIP=1 (direct link).
+$(error On Windows use: make HIP_DLL=1 hip-dll  (see backend_loader.c))
+endif
 ifeq (,$(LINUX))
 $(error HIP=1 is supported only on Linux)
 endif
@@ -234,13 +270,19 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
-all: glm$(EXE)
+all: glm$(EXE) hy3$(EXE)
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
+hy3: hy3$(EXE)
 
 glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) -o glm$(EXE) $(LDFLAGS)
+
+# Hy3 (hy_v3): same CFLAGS/LDFLAGS/CUDA_OBJ/METAL_OBJ wiring as glm, so
+# CUDA=1 / HIP=1 / METAL=1 apply identically without any hy3-specific build code.
+hy3$(EXE): hy3.c st.h json.h tok.h tok_unicode.h compat.h tier.h $(CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(CFLAGS) hy3.c $(CUDA_OBJ) $(METAL_OBJ) -o hy3$(EXE) $(LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h
@@ -256,6 +298,21 @@ cuda-dll: backend_cuda.cu backend_cuda.h
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
+		backend_cuda.cu -o coli_cuda.dll
+
+# Windows HIP DLL: compile backend_cuda.cu with hipcc (AMD HIP SDK for
+# Windows) into coli_cuda.dll — same file name and same coli_cuda_* exported
+# symbols as the CUDA DLL, so backend_loader.c loads whichever vendor's DLL is
+# present without any host-side changes. hipcc on Windows links via link.exe
+# (MSVC), so run this from a shell with the MSVC environment set (e.g. after
+# vcvars64.bat, or an "x64 Native Tools Command Prompt"), same as cuda-dll.
+# COLI_CUDA_BUILDING_DLL enables __declspec(dllexport) (backend_cuda.h keys
+# it off _WIN32, not _MSC_VER, so it applies to clang-based hipcc too).
+hip-dll: backend_cuda.cu backend_cuda.h
+	@command -v $(HIPCC) >/dev/null 2>&1 || { echo "hipcc not found: install the AMD HIP SDK for Windows and ensure hipcc is on PATH, or set HIPCC/HIP_PATH" >&2; exit 1; }
+	@command -v link >/dev/null 2>&1 || { echo "link.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	$(HIPCC) $(HIPCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
+		-L"$(ROCM_HOME)/lib" -lamdhip64 \
 		backend_cuda.cu -o coli_cuda.dll
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h
@@ -359,12 +416,13 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: glm$(EXE) olmoe$(EXE)
+install: glm$(EXE) hy3$(EXE) olmoe$(EXE)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
 	$(INSTALL) -m 755 glm$(EXE) $(DESTDIR)$(LIBEXECDIR)/glm$(EXE)
+	$(INSTALL) -m 755 hy3$(EXE) $(DESTDIR)$(LIBEXECDIR)/hy3$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
 	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
@@ -378,4 +436,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all glm cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all glm hy3 cuda-test hip-test gpu-compile cuda-bench cuda-dll hip-dll portable test-c test-python test check clean install uninstall bench

@@ -18,8 +18,18 @@ def _check(identifier, status, summary, **details):
 
 
 def cuda_linkage(engine_path):
-    """Return CUDA linkage state without loading the executable or CUDA runtime."""
-    if not Path(engine_path).is_file() or os.name != "posix":
+    """Return CUDA/HIP linkage state without loading the executable or GPU runtime."""
+    engine_path = Path(engine_path)
+    if not engine_path.is_file():
+        return {"linked": False, "missing": False}
+    if sys.platform == "win32":
+        # Windows never links CUDA/HIP directly (MSVC-ABI mismatch with the
+        # MinGW-built engine): backend_loader.c loads coli_cuda.dll (CUDA_DLL=1
+        # or HIP_DLL=1) at runtime instead, always under that filename next to
+        # the engine binary. There's no `ldd` here, so check for the DLL.
+        has_dll = (engine_path.parent / "coli_cuda.dll").is_file()
+        return {"linked": has_dll, "missing": not has_dll}
+    if os.name != "posix":
         return {"linked": False, "missing": False}
     try:
         result = subprocess.run(["ldd", str(engine_path)], capture_output=True, text=True,
@@ -96,13 +106,13 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
     elif selected_gpus and linkage.get("missing"):
         checks.append(_check("accelerator.cuda", "fail", "CUDA runtime library is missing"))
     elif selected_gpus and linkage.get("linked"):
-        checks.append(_check("accelerator.cuda", "pass", "CUDA engine and devices are available",
+        checks.append(_check("accelerator.cuda", "pass", "GPU engine and devices are available",
                              devices=[gpu["index"] for gpu in selected_gpus]))
     elif selected_gpus:
-        checks.append(_check("accelerator.cuda", "warn", "NVIDIA GPU detected but the engine is CPU-only",
+        checks.append(_check("accelerator.cuda", "warn", "GPU detected but the engine is CPU-only",
                              devices=[gpu["index"] for gpu in selected_gpus]))
     else:
-        checks.append(_check("accelerator.cuda", "skip", "no NVIDIA GPU detected; CPU path is available"))
+        checks.append(_check("accelerator.cuda", "skip", "no GPU detected; CPU path is available"))
 
     try:
         plan = build_plan(model, ram_gb, context, gpu_indices, vram_gb,
